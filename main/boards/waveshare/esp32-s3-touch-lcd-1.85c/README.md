@@ -66,6 +66,18 @@ CST816S 当前驱动只提供一个触点，不能据此确认可靠的多指排
 平台 STT 没有轮次标识时，本地轮次可过滤已排队的旧事件与新发言前的旧 STT，
 同通道迟到旧 STT 若恰好落在新 VAD 之后仍无法严格归属，不能据此宣称完全隔离。
 
+### 粉衣小女孩和自定义唤醒资源
+
+可选资源源文件与参数位于 [`assets/home-girl/`](assets/home-girl/README.md)。
+先按 `config.home.json` 构建固件，再运行 `python scripts/build_home_girl_assets.py`，
+生成独立的 `build/home-girl-assets.bin`。它保留默认资源中的中文字体及 glyph
+元数据，加入粉衣日系小女孩表情、待机眨眼和中文 MultiNet7 唤醒词“你好小妹妹”。
+该资源不会自动并入常规构建；部署须显式选择独立资源文件，常规
+`generated_assets.bin` 仍使用构建配置选择的表情及唤醒模型。
+
+这是通用离线命令识别路径，实际误唤醒、漏唤醒、播放打断和暂停恢复需设备验证；
+资源索引或屏幕提示不能单独证明识别词已激活，应核对启动命令表并实际唤醒。
+
 ### 可选本地提醒
 
 `CONFIG_WAVESHARE_1_85C_HOME_NETWORK_ALERTS` 和

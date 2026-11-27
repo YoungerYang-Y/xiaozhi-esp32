@@ -1,0 +1,34 @@
+{
+  "image_size": 160,
+  "wake_word": {
+    "language": "cn",
+    "duration": 3000,
+    "threshold": 0.2,
+    "commands": [
+      {"command": "ni hao xiao mei mei", "text": "你好小妹妹", "action": "wake"}
+    ]
+  },
+  "emotions": {
+    "neutral": "neutral",
+    "angry": "angry",
+    "confident": "happy",
+    "confused": "thinking",
+    "cool": "neutral",
+    "crying": "sad",
+    "delicious": "happy",
+    "embarrassed": "winking",
+    "funny": "happy",
+    "happy": "happy",
+    "kissy": "winking",
+    "laughing": "happy",
+    "loving": "happy",
+    "relaxed": "neutral",
+    "sad": "sad",
+    "shocked": "surprised",
+    "silly": "winking",
+    "sleepy": "sleepy",
+    "surprised": "surprised",
+    "thinking": "thinking",
+    "winking": "winking"
+  }
+}
