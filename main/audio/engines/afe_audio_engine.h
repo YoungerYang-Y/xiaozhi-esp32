@@ -2,8 +2,6 @@
 #define AFE_AUDIO_ENGINE_H
 
 #include <atomic>
-#include <condition_variable>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -31,6 +29,7 @@ public:
     void EnableWakeWordDetection(bool enable) override;
     void EnableVoiceProcessing(bool enable) override;
     void EnableDeviceAec(bool enable) override;
+    void ResetCapture() override;
 
     bool HasWakeWord() const override;
     bool IsWakeWordDetectionEnabled() const override;
@@ -88,18 +87,15 @@ private:
     std::vector<int16_t> input_buffer_;
     std::vector<int16_t> output_buffer_;
     std::mutex input_buffer_mutex_;
+    // Fetch/Opus work stays outside this lock. Controls and result callbacks
+    // share it so no old callback can commit after disable/reset returns.
+    std::mutex callback_mutex_;
 
     std::function<void(const std::string&)> wake_word_detected_callback_;
     std::function<void(std::vector<int16_t>&&)> output_callback_;
     std::function<void(bool)> vad_state_change_callback_;
 
-    TaskHandle_t wake_word_encode_task_ = nullptr;
-    StaticTask_t* wake_word_encode_task_buffer_ = nullptr;
-    StackType_t* wake_word_encode_task_stack_ = nullptr;
-    WakeWordAudioCache wake_word_audio_cache_;
-    std::deque<std::vector<uint8_t>> wake_word_opus_;
-    std::mutex wake_word_mutex_;
-    std::condition_variable wake_word_cv_;
+    WakeWordAudioEncoder wake_word_encoder_;
 
     void ProcessingTask();
     void UpdateActiveState();

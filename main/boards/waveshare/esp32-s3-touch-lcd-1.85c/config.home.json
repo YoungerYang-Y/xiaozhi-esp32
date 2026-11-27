@@ -1,0 +1,14 @@
+{
+    "manufacturer": "waveshare",
+    "type": "esp32-s3-touch-lcd-1.85c",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "esp32-s3-touch-lcd-1.85c-home",
+            "sdkconfig_append": [
+                "CONFIG_VERSION_2_0=y",
+                "CONFIG_WAVESHARE_1_85C_HOME=y"
+            ]
+        }
+    ]
+}

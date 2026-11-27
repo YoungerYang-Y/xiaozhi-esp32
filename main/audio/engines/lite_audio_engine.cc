@@ -10,14 +10,15 @@
 LiteAudioEngine::LiteAudioEngine() = default;
 LiteAudioEngine::~LiteAudioEngine() = default;
 
-bool LiteAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) {
+bool LiteAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
+                                 srmodel_list_t* models_list) {
     codec_ = codec;
     models_list_ = models_list;
     frame_samples_ = frame_duration_ms * 16000 / 1000;
     output_buffer_.reserve(frame_samples_);
 
     should_have_wake_word_ = models_list != nullptr &&
-        esp_srmodel_filter(models_list, ESP_WN_PREFIX, nullptr) != nullptr;
+                             esp_srmodel_filter(models_list, ESP_WN_PREFIX, nullptr) != nullptr;
 #if CONFIG_USE_ESP_WAKE_WORD
     should_have_wake_word_ = should_have_wake_word_ || models_list == nullptr;
 #endif
@@ -60,11 +61,16 @@ void LiteAudioEngine::EnableWakeWordDetection(bool enable) {
 }
 
 void LiteAudioEngine::EnableVoiceProcessing(bool enable) {
+    std::lock_guard<std::mutex> lock(output_mutex_);
     voice_processing_enabled_ = enable;
     if (!enable) {
-        std::lock_guard<std::mutex> lock(output_mutex_);
         output_buffer_.clear();
     }
+}
+
+void LiteAudioEngine::ResetCapture() {
+    EnableWakeWordDetection(false);
+    EnableVoiceProcessing(false);
 }
 
 void LiteAudioEngine::EnableDeviceAec(bool enable) {
@@ -83,13 +89,9 @@ std::vector<std::string> LiteAudioEngine::GetWakeWords() const {
     return wake_word_ ? wake_word_->GetWakeWords() : std::vector<std::string>{};
 }
 
-bool LiteAudioEngine::IsWakeWordDetectionEnabled() const {
-    return wake_word_enabled_;
-}
+bool LiteAudioEngine::IsWakeWordDetectionEnabled() const { return wake_word_enabled_; }
 
-bool LiteAudioEngine::IsVoiceProcessingEnabled() const {
-    return voice_processing_enabled_;
-}
+bool LiteAudioEngine::IsVoiceProcessingEnabled() const { return voice_processing_enabled_; }
 
 size_t LiteAudioEngine::GetFeedSize() const {
     std::lock_guard<std::mutex> lock(wake_word_mutex_);
@@ -99,7 +101,8 @@ size_t LiteAudioEngine::GetFeedSize() const {
     return frame_samples_;
 }
 
-void LiteAudioEngine::OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) {
+void LiteAudioEngine::OnWakeWordDetected(
+    std::function<void(const std::string& wake_word)> callback) {
     wake_word_detected_callback_ = std::move(callback);
 }
 
@@ -171,6 +174,9 @@ void LiteAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {
     }
 
     std::lock_guard<std::mutex> lock(output_mutex_);
+    if (!voice_processing_enabled_) {
+        return;
+    }
     const size_t channels = codec_->input_channels();
     if (channels <= 1) {
         output_buffer_.insert(output_buffer_.end(), data.begin(), data.end());
@@ -186,8 +192,8 @@ void LiteAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {
             output_buffer_.clear();
             output_buffer_.reserve(frame_samples_);
         } else {
-            output_callback_(std::vector<int16_t>(
-                output_buffer_.begin(), output_buffer_.begin() + frame_samples_));
+            output_callback_(std::vector<int16_t>(output_buffer_.begin(),
+                                                  output_buffer_.begin() + frame_samples_));
             output_buffer_.erase(output_buffer_.begin(), output_buffer_.begin() + frame_samples_);
         }
     }

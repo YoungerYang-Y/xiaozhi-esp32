@@ -15,6 +15,7 @@
 
 class DynamicGlyphCache;
 class LvglFont;
+class LvglTheme;
 
 class LvglDisplay : public Display {
 public:
@@ -40,7 +41,9 @@ protected:
     lv_obj_t* network_label_ = nullptr;
     lv_obj_t* status_label_ = nullptr;
     lv_obj_t* notification_label_ = nullptr;
+    lv_obj_t* home_clock_label_ = nullptr;
     lv_obj_t* mute_label_ = nullptr;
+    lv_obj_t* volume_label_ = nullptr;
     lv_obj_t* battery_label_ = nullptr;
     lv_obj_t* low_battery_popup_ = nullptr;
     lv_obj_t* low_battery_label_ = nullptr;
@@ -48,10 +51,16 @@ protected:
     const char* battery_icon_ = nullptr;
     const char* network_icon_ = nullptr;
     bool muted_ = false;
+    bool battery_status_supported_ = false;
+    bool battery_status_unknown_ = true;
+    bool battery_status_low_ = false;
+    bool home_status_is_icon_ = false;
+
+    void ApplyBatteryStatusStyle(LvglTheme* theme);
 
     std::chrono::system_clock::time_point last_status_update_time_;
     esp_timer_handle_t notification_timer_ = nullptr;
-    int last_displayed_clock_min_ = -1;   // -1 forces update on first idle tick
+    int last_displayed_clock_min_ = -1;  // -1 forces update on first idle tick
     std::unique_ptr<DynamicGlyphCache> dynamic_glyph_cache_;
 
     friend class DisplayLockGuard;

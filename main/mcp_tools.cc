@@ -164,31 +164,119 @@ void McpServer::AddCommonTools() {
             "reset by its button, or crashed. This is about the device, not about the "
             "conversation.\n"
             "3. As the first step to control the device (e.g. turn up / down the volume of the "
-            "audio speaker, etc.)",
+            "audio speaker, etc.)"
+#if CONFIG_WAVESHARE_1_85C_HOME
+            "\nScreen brightness is the configured value. display_off and applied_brightness "
+            "describe the physical screen state. applied=false or a null applied_brightness "
+            "does not confirm a hardware change. setting_error indicates a setting or hardware "
+            "operation failed; use persistence and application fields when confirming results. "
+            "Battery state unknown means the reading is unavailable. unclassified with band "
+            "one_bar, two_bars or three_bars is a rough voltage band; answer with the number of "
+            "bars. Do not infer percentage, charging, low battery or normal battery from it. "
+            "Only explicit state low or normal confirms that classification. "
+            "network.connected describes the Wi-Fi link, not availability of the voice service."
+#if CONFIG_WAVESHARE_1_85C_HOME_NETWORK_ALERTS
+            " network.service_state is available only after the required current service "
+            "phases have positive evidence; unknown does not confirm service recovery."
+#endif
+#endif
+            ,
             PropertyList(), [&board](const PropertyList& properties) -> ReturnValue {
+#if CONFIG_WAVESHARE_1_85C_HOME
+                ESP_LOGI(TAG, "Device status requested");
+#endif
                 return board.GetDeviceStatusJson();
             });
 
     AddTool("self.audio_speaker.set_volume",
             "Set the volume of the audio speaker. If the current volume is unknown, you must call "
-            "`self.get_device_status` tool first and then call this tool.",
+            "`self.get_device_status` tool first and then call this tool. "
+#if CONFIG_WAVESHARE_1_85C_HOME
+            "The result reports the configured volume, persistence and hardware application. "
+            "An inactive speaker can save a setting for the next playback. "
+#endif
+            "Confirm the returned setting only when the tool succeeds.",
             PropertyList({Property("volume", kPropertyTypeInteger, 0, 100)}),
-            [&board](const PropertyList& properties) -> ReturnValue {
+            [&board](const PropertyList& properties) -> ToolResult {
                 auto codec = board.GetAudioCodec();
+                if (codec == nullptr) {
+                    return std::unexpected("The speaker is unavailable.");
+                }
+#if CONFIG_WAVESHARE_1_85C_HOME
+                const auto result =
+                    codec->SetOutputVolumeChecked(properties["volume"].value<int>());
+                if (result.error != ESP_OK) {
+                    ESP_LOGW(TAG, "Volume setting failed: %d", result.error);
+                    return std::unexpected(
+                        "Volume adjustment failed. Read device status before confirming a value.");
+                }
+                ESP_LOGI(TAG, "Volume configured=%d persisted=%d applied=%d", result.volume,
+                         result.persisted, result.applied);
+                auto status = cJSON_CreateObject();
+                if (!status || !cJSON_AddNumberToObject(status, "volume", result.volume) ||
+                    !cJSON_AddBoolToObject(status, "persisted", result.persisted) ||
+                    !cJSON_AddBoolToObject(status, "applied", result.applied)) {
+                    cJSON_Delete(status);
+                    return std::unexpected("Unable to report volume. Read device status again.");
+                }
+                return ReturnValue{status};
+#else
                 codec->SetOutputVolume(properties["volume"].value<int>());
-                return true;
+                return ReturnValue{true};
+#endif
             });
 
     auto backlight = board.GetBacklight();
     if (backlight) {
-        AddTool("self.screen.set_brightness", "Set the brightness of the screen.",
-                PropertyList({Property("brightness", kPropertyTypeInteger, 0, 100)}),
-                [backlight](const PropertyList& properties) -> ReturnValue {
-                    uint8_t brightness =
-                        static_cast<uint8_t>(properties["brightness"].value<int>());
-                    backlight->SetBrightness(brightness, true);
-                    return true;
-                });
+#if CONFIG_WAVESHARE_1_85C_HOME
+        constexpr int minimum_brightness = 1;
+        const char* brightness_description =
+            "Set and save brightness from 1 to 100. Manual display-off remains active. "
+            "When display_off is true, the configured brightness is used when the screen is "
+            "turned on. Confirm the actual returned setting only when the tool succeeds.";
+#else
+        constexpr int minimum_brightness = 0;
+        const char* brightness_description = "Set the brightness of the screen.";
+#endif
+        AddTool(
+            "self.screen.set_brightness", brightness_description,
+            PropertyList({Property("brightness", kPropertyTypeInteger, minimum_brightness, 100)}),
+            [backlight](const PropertyList& properties) -> ToolResult {
+                uint8_t brightness = static_cast<uint8_t>(properties["brightness"].value<int>());
+#if CONFIG_WAVESHARE_1_85C_HOME
+                const auto result = backlight->SetBrightnessChecked(brightness);
+                if (result.error != ESP_OK) {
+                    ESP_LOGW(TAG, "Brightness setting failed: %d", result.error);
+                    return std::unexpected(
+                        "Brightness adjustment failed. Read device status before confirming a "
+                        "value.");
+                }
+                ESP_LOGI(TAG, "Brightness configured=%d applied=%d display_off=%d persisted=%d",
+                         result.brightness, result.applied_brightness, result.display_off,
+                         result.persisted);
+                auto status = cJSON_CreateObject();
+                if (!status || !cJSON_AddNumberToObject(status, "brightness", result.brightness) ||
+                    !cJSON_AddBoolToObject(status, "display_off", result.display_off) ||
+                    !cJSON_AddBoolToObject(status, "persisted", result.persisted)) {
+                    cJSON_Delete(status);
+                    return std::unexpected(
+                        "Unable to report brightness. Read device status again.");
+                }
+                auto applied = result.applied_brightness >= 0
+                                   ? cJSON_AddNumberToObject(status, "applied_brightness",
+                                                             result.applied_brightness)
+                                   : cJSON_AddNullToObject(status, "applied_brightness");
+                if (!applied) {
+                    cJSON_Delete(status);
+                    return std::unexpected(
+                        "Unable to report brightness. Read device status again.");
+                }
+                return ReturnValue{status};
+#else
+                backlight->SetBrightness(brightness, true);
+                return ReturnValue{true};
+#endif
+            });
     }
 
 #ifdef HAVE_LVGL

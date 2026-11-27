@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #define MQTT_PING_INTERVAL_SECONDS 90
@@ -46,6 +47,8 @@ private:
     mutable std::mutex channel_mutex_;
     std::mutex crypto_mutex_;
     std::unique_ptr<Mqtt> mqtt_;
+    inline static std::atomic<uint64_t> next_control_attempt_{0};
+    std::atomic<uint64_t> control_attempt_{0};
     // Shared so SendAudio() can hold a reference and call Send() without
     // holding channel_mutex_; the UDP receive callback (run on the modem's
     // AT event task) also needs that mutex, so holding it across a blocking
@@ -67,6 +70,7 @@ private:
             }
         }
         UdpProbe probe;
+        ChannelToken source_token = 0;
         psa_key_id_t key = PSA_KEY_ID_NULL;
         std::atomic<bool> receiving_pong{false};
     };
@@ -75,12 +79,16 @@ private:
     esp_timer_handle_t probe_timer_ = nullptr;
     std::atomic<bool> awaiting_hello_{false};
     std::atomic<bool> hello_valid_{false};
+    ChannelToken health_channel_token_ = 0;  // Protected by channel_mutex_.
+    bool media_started_ = false;
 
     void ArmProbeTimer(int64_t due);
     void ReceivePong(const std::shared_ptr<ProbeChannel>& channel, const std::string& data);
+    void CloseAudioChannelForGeneration(bool send_goodbye,
+                                        std::optional<uint64_t> expected_generation);
 
     bool StartMqttClient(bool report_error = false);
-    void ParseServerHello(const cJSON* root);
+    void ParseServerHello(const cJSON* root, ChannelToken token, uint64_t control_attempt);
     bool DecodeHexString(const std::string& hex_string, std::string& decoded);
     bool CryptAesCtr(const uint8_t* input, size_t input_size, const uint8_t* nonce,
                      uint8_t* output);

@@ -171,6 +171,7 @@ class StartupAssetsTests(unittest.TestCase):
                 StateMachine state_machine_;
                 int event_group_ = 0, clock_timer_handle_ = 0;
                 bool assets_version_checked_ = false;
+                bool IsListeningPaused() const { return false; }
                 void Initialize();
                 void CheckAssetsVersion();
                 void SetDeviceState(DeviceState) {}

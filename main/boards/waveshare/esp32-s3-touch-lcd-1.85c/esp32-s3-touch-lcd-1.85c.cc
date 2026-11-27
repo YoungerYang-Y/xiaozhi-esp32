@@ -1,27 +1,37 @@
-#include "wifi_board.h"
-#include "codecs/no_audio_codec.h"
-#include "codecs/box_audio_codec.h"
-#include "display/lcd_display.h"
-#include "system_reset.h"
 #include "application.h"
 #include "button.h"
+#include "codecs/box_audio_codec.h"
+#include "codecs/no_audio_codec.h"
 #include "config.h"
+#include "display/lcd_display.h"
+#include "system_reset.h"
+#include "wifi_board.h"
 
-#include <esp_log.h>
-#include "i2c_device.h"
 #include <driver/i2c_master.h>
 #include <driver/ledc.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_st77916.h>
+#include <esp_log.h>
 #include <esp_timer.h>
 #include "esp_io_expander_tca9554.h"
+#include "i2c_device.h"
+
+#if CONFIG_WAVESHARE_1_85C_HOME
+#include <esp_lcd_touch_cst816s.h>
+#include <freertos/task.h>
+
+#include <atomic>
+
+#include "home_battery_status.h"
+#include "home_touch_gesture.h"
+#endif
 
 #define TAG "waveshare_lcd_1_85c"
 
-#define LCD_OPCODE_WRITE_CMD        (0x02ULL)
-#define LCD_OPCODE_READ_CMD         (0x0BULL)
-#define LCD_OPCODE_WRITE_COLOR      (0x32ULL)
+#define LCD_OPCODE_WRITE_CMD (0x02ULL)
+#define LCD_OPCODE_READ_CMD (0x0BULL)
+#define LCD_OPCODE_WRITE_COLOR (0x32ULL)
 
 static const st77916_lcd_init_cmd_t vendor_specific_init_new[] = {
     {0xF0, (uint8_t []){0x28}, 1, 0},
@@ -213,10 +223,156 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_new[] = {
 
 class CustomBoard : public WifiBoard {
 private:
+#if CONFIG_WAVESHARE_1_85C_HOME
+    static constexpr uint16_t kBootLongPressMs = 3000;
+    static constexpr uint16_t kBootShortPressMs = 300;
+#else
+    static constexpr uint16_t kBootLongPressMs = 0;
+    static constexpr uint16_t kBootShortPressMs = 0;
+#endif
     Button boot_button_;
     i2c_master_bus_handle_t i2c_bus_;
     esp_io_expander_handle_t io_expander = NULL;
     LcdDisplay* display_;
+#if CONFIG_WAVESHARE_1_85C_HOME
+    // The board and these handles live for the firmware's lifetime. Failed
+    // initialization releases the handles before falling back to BOOT/voice.
+    esp_lcd_panel_io_handle_t touch_io_ = nullptr;
+    esp_lcd_touch_handle_t touch_ = nullptr;
+    TaskHandle_t touch_task_ = nullptr;
+    std::atomic_bool touch_action_pending_{false};
+    HomeBatteryStatus home_battery_status_;
+
+    static void TouchInterrupt(esp_lcd_touch_handle_t touch) {
+        auto* board = static_cast<CustomBoard*>(touch->config.user_data);
+        BaseType_t task_woken = pdFALSE;
+        if (board->touch_task_ != nullptr) {
+            vTaskNotifyGiveFromISR(board->touch_task_, &task_woken);
+        }
+        if (task_woken) {
+            portYIELD_FROM_ISR();
+        }
+    }
+
+    void PollTouch() {
+        HomeTouchGesture gesture;
+        // A finger already down when the observer starts is not a complete tap.
+        gesture.Update(0, false, 0);
+        bool active = false;
+        uint32_t retry_ms = 0;
+        uint64_t last_warning_ms = 0;
+        bool warned = false;
+        for (;;) {
+            if (!active) {
+                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(HOME_TOUCH_POLL_INTERVAL_MS));
+                ulTaskNotifyTake(pdTRUE, 0);
+            }
+            const uint64_t now_ms = esp_timer_get_time() / 1000;
+            uint8_t point_count = 0;
+            esp_lcd_touch_point_data_t point = {};
+            // This CST816S driver clamps the controller count to one point; it
+            // cannot provide a reliable multi-finger rejection signal.
+            esp_err_t err = esp_lcd_touch_read_data(touch_);
+            if (err == ESP_OK) {
+                err = esp_lcd_touch_get_data(touch_, &point, &point_count, 1);
+            }
+            if (err == ESP_OK && point_count != 0 &&
+                (point.x >= DISPLAY_WIDTH || point.y >= DISPLAY_HEIGHT)) {
+                err = ESP_ERR_INVALID_RESPONSE;
+            }
+            if (err != ESP_OK) {
+                gesture.Update(now_ms, false, 0);
+                if (!warned || now_ms - last_warning_ms >= 10000) {
+                    ESP_LOGW(TAG, "Touch read failed: %s", esp_err_to_name(err));
+                    last_warning_ms = now_ms;
+                    warned = true;
+                }
+                // The component also logs read failures. Back off outside the
+                // main/audio tasks so an absent controller cannot flood logs.
+                retry_ms = retry_ms == 0 ? 1000 : retry_ms * 2;
+                if (retry_ms > 10000) {
+                    retry_ms = 10000;
+                }
+                vTaskDelay(pdMS_TO_TICKS(retry_ms));
+                active = true;
+                continue;
+            }
+            retry_ms = 0;
+            if (gesture.Update(now_ms, true, point_count, point.x, point.y) &&
+                !touch_action_pending_.exchange(true)) {
+                Application::GetInstance().Schedule([this]() {
+                    auto* backlight = GetBacklight();
+                    if (backlight != nullptr) {
+                        const esp_err_t err = backlight->SetDisplayOff(!backlight->display_off());
+                        if (err != ESP_OK) {
+                            ESP_LOGW(TAG, "Touch backlight toggle failed: %s",
+                                     esp_err_to_name(err));
+                        }
+                    }
+                    touch_action_pending_.store(false);
+                });
+            }
+            active = gesture.NeedsPolling();
+        }
+    }
+
+    void InitializeHomeTouch() {
+        // Preserve the component's IO values without depending on SDK field order.
+        esp_lcd_panel_io_i2c_config_t io_config = {};
+        io_config.dev_addr = ESP_LCD_TOUCH_IO_I2C_CST816S_ADDRESS;
+        io_config.scl_speed_hz = 100000;
+        io_config.control_phase_bytes = 1;
+        io_config.lcd_cmd_bits = 8;
+        io_config.flags.disable_control_phase = true;
+        esp_err_t err = esp_lcd_new_panel_io_i2c(i2c_bus_, &io_config, &touch_io_);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Touch IO unavailable: %s", esp_err_to_name(err));
+            return;
+        }
+        esp_lcd_touch_config_t touch_config = {};
+        touch_config.x_max = DISPLAY_WIDTH - 1;
+        touch_config.y_max = DISPLAY_HEIGHT - 1;
+        touch_config.rst_gpio_num = TP_PIN_NUM_RST;
+        touch_config.int_gpio_num = TP_PIN_NUM_INT;
+        touch_config.user_data = this;
+        // EXIO0/1 have already reset LCD/touch. GPIO4 only wakes this task;
+        // no bus access or application work happens in the interrupt handler.
+        err = esp_lcd_touch_new_i2c_cst816s(touch_io_, &touch_config, &touch_);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Touch controller unavailable: %s", esp_err_to_name(err));
+            esp_lcd_panel_io_del(touch_io_);
+            touch_io_ = nullptr;
+            return;
+        }
+        if (xTaskCreate([](void* arg) { static_cast<CustomBoard*>(arg)->PollTouch(); },
+                        "home_touch", 3072, this, 2, &touch_task_) != pdPASS) {
+            ESP_LOGW(TAG, "Touch task unavailable");
+            esp_lcd_touch_del(touch_);
+            touch_ = nullptr;
+            esp_lcd_panel_io_del(touch_io_);
+            touch_io_ = nullptr;
+            return;
+        }
+        err = esp_lcd_touch_register_interrupt_callback(touch_, TouchInterrupt);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Touch interrupt unavailable: %s", esp_err_to_name(err));
+            gpio_intr_disable(TP_PIN_NUM_INT);
+            esp_lcd_touch_register_interrupt_callback(touch_, nullptr);
+            vTaskDelete(touch_task_);
+            touch_task_ = nullptr;
+            esp_lcd_touch_del(touch_);
+            touch_ = nullptr;
+            esp_lcd_panel_io_del(touch_io_);
+            touch_io_ = nullptr;
+            return;
+        }
+        // Observe a clean initial sample, including a finger held during boot.
+        xTaskNotifyGive(touch_task_);
+        ESP_LOGI(TAG, "HOME touch double-tap enabled (single-point controller)");
+    }
+#endif
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -228,7 +384,7 @@ private:
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
-    
+
     void InitializeTca9554(void)
     {
         esp_err_t ret = esp_io_expander_new_i2c_tca9554(i2c_bus_, I2C_ADDRESS, &io_expander);
@@ -361,42 +517,61 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
+#if CONFIG_WAVESHARE_1_85C_HOME
+            auto state = app.GetDeviceState();
+            if (state == kDeviceStateWifiConfiguring || state == kDeviceStateAudioTesting) {
+                app.ToggleChatState();
+            } else {
+                app.PrimaryButtonPressed();
+            }
+#else
             app.ToggleChatState();
+#endif
         });
+#if CONFIG_WAVESHARE_1_85C_HOME
+        boot_button_.OnPressUp([]() { ESP_LOGI(TAG, "BOOT released"); });
+        boot_button_.OnDoubleClick([]() { Application::GetInstance().ToggleListeningPause(); });
+#endif
     }
 
 public:
-    CustomBoard() :
-        boot_button_(BOOT_BUTTON_GPIO) {
+    CustomBoard() : boot_button_(BOOT_BUTTON_GPIO, false, kBootLongPressMs, kBootShortPressMs) {
         InitializeI2c();
         InitializeTca9554();
         InitializeSpi();
         Initializest77916Display();
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
+#if CONFIG_WAVESHARE_1_85C_HOME
+        InitializeHomeTouch();
+        home_battery_status_.Start(HOME_BATTERY_ADC_PIN);
+#endif
     }
-
-    #ifdef CONFIG_VERSION_1_0
+#ifdef CONFIG_VERSION_1_0
     virtual AudioCodec* GetAudioCodec() override {
         static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT, I2S_STD_SLOT_LEFT, AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN, I2S_STD_SLOT_RIGHT); // I2S_STD_SLOT_LEFT / I2S_STD_SLOT_RIGHT / I2S_STD_SLOT_BOTH
 
         return &audio_codec;
     }
-    #endif
+#endif
 
-    #ifdef CONFIG_VERSION_2_0
+#ifdef CONFIG_VERSION_2_0
     virtual AudioCodec* GetAudioCodec() override {
         static BoxAudioCodec audio_codec(i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR, AUDIO_INPUT_REFERENCE);
             return &audio_codec;
     }
-    #endif
+#endif
+
+#if CONFIG_WAVESHARE_1_85C_HOME
+    BatteryStatus GetBatteryStatus() const override { return home_battery_status_.GetStatus(); }
+#endif
 
     virtual Display* GetDisplay() override {
         return display_;
     }
-    
+
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;

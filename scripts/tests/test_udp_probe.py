@@ -113,13 +113,14 @@ int main() {
         opened_start = text.index('bool MqttProtocol::IsAudioChannelOpened() const {')
         sends_start = text.index('bool MqttProtocol::SendText(')
         sends_end = text.index('void MqttProtocol::CloseAudioChannel(', sends_start)
-        callback_start = text.index('    udp->OnMessage([this, generation, probe]')
+        callback_start = text.index('    udp->OnMessage([this, generation, probe, token]')
         callback_end = text.index('\n    if (auto connected = udp->Connect', callback_start)
         callback = text[callback_start:callback_end]
         close_end = text.index('bool MqttProtocol::OpenAudioChannel()', sends_end)
         method = (text[sends_start:close_end] + text[opened_start:] +
                   '\nvoid MqttProtocol::InstallReceiver(std::shared_ptr<Udp> udp, uint64_t generation, '
-                  'std::shared_ptr<ProbeChannel> probe) {\n' + callback + '\n}\n')
+                  'std::shared_ptr<ProbeChannel> probe) {\n'
+                  'const auto token = channel_token();\n' + callback + '\n}\n')
         # Instrument lock acquisition only; keep the production callback/routing/body unchanged.
         method = method.replace('std::lock_guard<std::mutex>',
                                 'std::lock_guard<ObservedMutex>')
@@ -127,6 +128,7 @@ int main() {
 #include "main/protocols/udp_probe.h"
 #include <cassert>
 #include <memory>
+#include <optional>
 #include <algorithm>
 #include <mutex>
 #include <atomic>
@@ -264,9 +266,21 @@ struct Mqtt {
     }
 };
 struct MqttProtocol {
+    using ChannelToken = uint64_t;
+    enum class HealthStage { Control, Handshake, Media };
+    enum class HealthOutcome { Started, Failed, Succeeded, Retired };
+    struct HealthEvent {
+        HealthStage stage;
+        HealthOutcome outcome;
+        uint64_t attempt_id;
+        ChannelToken source_channel_token;
+        bool udp_probe = false;
+    };
+    void EmitHealthEvent(const HealthEvent&) {}
     struct ProbeChannel {
         explicit ProbeChannel(const uint8_t* ssrc) : probe(ssrc) {}
         UdpProbe probe;
+        ChannelToken source_token = 0;
         Key key{};
         std::atomic<bool> receiving_pong{false};
     };
@@ -285,15 +299,32 @@ struct MqttProtocol {
     int server_sample_rate_ = 24000;
     int server_frame_duration_ = 60;
     std::chrono::steady_clock::time_point last_incoming_time_;
-    std::function<void(std::unique_ptr<AudioStreamPacket>)> on_incoming_audio_;
+    std::function<void(std::unique_ptr<AudioStreamPacket>, ChannelToken)> on_incoming_audio_;
     uint64_t channel_generation_ = 0;
+    std::atomic<uint64_t> control_attempt_{1};
+    ChannelToken health_channel_token_ = 0;
+    bool media_started_ = false;
     std::atomic<bool> awaiting_hello_{false};
+    std::atomic<bool> hello_valid_{false};
     std::string session_id_ = "test-session";
-    std::function<void()> on_audio_channel_closed_ = [this] { ++closes; };
+    std::string session_id() const { return session_id_; }
+    std::atomic<ChannelToken> channel_token_{0};
+    ChannelToken channel_token() const { return channel_token_.load(); }
+    ChannelToken AdvanceChannelToken() { return ++channel_token_; }
+    std::function<void(ChannelToken)> on_audio_channel_closed_ = [this](auto token) {
+        assert(token == channel_token());
+        ++closes;
+    };
     bool SendText(const std::string&);
     bool SendAudio(std::unique_ptr<AudioStreamPacket>);
+    std::function<void()> on_decrypt;
     bool CryptAesCtr(const uint8_t* input, size_t size, const uint8_t*, uint8_t* output) {
         memcpy(output, input, size);
+        if (on_decrypt) {
+            auto callback = std::move(on_decrypt);
+            on_decrypt = nullptr;
+            callback();
+        }
         return true;
     }
     bool error_occurred_ = false;
@@ -307,6 +338,7 @@ struct MqttProtocol {
         ++failures;
     }
     void CloseAudioChannel(bool send_goodbye = true);
+    void CloseAudioChannelForGeneration(bool, std::optional<uint64_t>);
     void InstallReceiver(std::shared_ptr<Udp>, uint64_t, std::shared_ptr<ProbeChannel>);
     void ArmProbeTimer(int64_t due);
     void ProcessPending();
@@ -484,7 +516,9 @@ int main() {
     auto wire_session = [&]() {
         if (protocol.udp_) protocol.CloseAudioChannel(false);
         auto current = fresh();
+        protocol.AdvanceChannelToken();
         ++protocol.channel_generation_;
+        protocol.remote_sequence_ = 0;
         protocol.udp_ = std::make_shared<Udp>();
         protocol.InstallReceiver(protocol.udp_, protocol.channel_generation_, current);
         return current;
@@ -586,8 +620,9 @@ int main() {
     // PONG routing moved ahead of the gate, but audio must still honor generation.
     int audio_received = 0;
     protocol.remote_sequence_ = 0;
-    protocol.on_incoming_audio_ = [&](auto packet) {
+    protocol.on_incoming_audio_ = [&](auto packet, auto token) {
         assert(packet->payload.size() == 3);
+        assert(token == protocol.channel_token());
         ++audio_received;
     };
     auto audio_bytes = reply.substr(0, 16);
@@ -599,6 +634,16 @@ int main() {
     assert(audio_received == 0 && protocol.remote_sequence_ == 0);
     reopened_wire->Deliver(audio_bytes);
     assert(audio_received == 1 && protocol.remote_sequence_ == 1);
+
+    // A datagram can pass its entry gate before close/reopen happens during
+    // decryption. The final generation gate must protect the new sequence state.
+    channel = wire_session();
+    wire = protocol.udp_;
+    protocol.on_decrypt = [&] { channel = wire_session(); };
+    wire->Deliver(audio_bytes);
+    assert(audio_received == 1 && protocol.remote_sequence_ == 0);
+    protocol.udp_->Deliver(audio_bytes);
+    assert(audio_received == 2 && protocol.remote_sequence_ == 1);
 
 }
 '''

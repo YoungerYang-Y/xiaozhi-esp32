@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <string_view>
 
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -87,6 +88,17 @@ struct AudioServiceCallbacks {
     // Fired when the decode/playback queues and their in-flight work are drained.
     std::function<void(void)> on_playback_drained;
     std::function<void(uint32_t playback_id, uint32_t media_position_ms)> on_playback_progress;
+    // Called outside service locks on the local worker. Callers must Schedule
+    // application mutations and correlate ids. Admission alone never fires started.
+    // A successful in-flight write is a monotonic fact: started can arrive after
+    // cancellation, always before finished. Keep cancelled ids until finished.
+    std::function<void(uint32_t id)> on_local_sound_started;
+    std::function<void(uint32_t id, bool completed)> on_local_sound_finished;
+    // PCM decoded for accepted conversation audio; caller correlates the channel
+    // token/request captured in the packet, then Schedules application work.
+    // Never emitted for local/notify audio.
+    std::function<void(uint64_t source_channel_token, uint64_t source_request_id)>
+        on_incoming_audio_decoded;
 };
 
 enum AudioTaskType {
@@ -101,6 +113,18 @@ struct AudioTask {
     uint32_t timestamp = 0;
     uint32_t playback_id = 0;
     uint32_t media_position_ms = 0;
+    uint32_t capture_generation = 0;
+    uint32_t local_sound_generation = 0;
+    uint32_t playback_generation = 0;
+};
+
+// Keep local producer ownership out of the transport-neutral packet contract.
+struct QueuedAudioPacket {
+    std::unique_ptr<AudioStreamPacket> packet;
+    uint32_t local_sound_generation = 0;
+    QueuedAudioPacket(std::unique_ptr<AudioStreamPacket> value, uint32_t generation = 0)
+        : packet(std::move(value)), local_sound_generation(generation) {}
+    AudioStreamPacket* operator->() const { return packet.get(); }
 };
 
 struct DebugStatistics {
@@ -123,7 +147,7 @@ public:
     std::unique_ptr<AudioStreamPacket> PopWakeWordPacket();
     const std::string& GetLastWakeWord() const;
     std::vector<std::string> GetWakeWords() const;
-    bool IsVoiceDetected() const { return voice_detected_; }
+    bool IsVoiceDetected() const { return voice_detected_.load(); }
     bool IsIdle();
     bool IsPlaybackIdle();
     bool IsWakeWordRunning() const {
@@ -139,12 +163,23 @@ public:
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
+    void SetInputPaused(bool paused);
+    bool input_paused() const { return input_paused_.load(); }
+    void ResetCapture();
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
+    // At most one owned request (64 KiB, 10 seconds, 2000 packets). Returns
+    // immediately on contention/busy/unsupported; parsing and hardware run off caller.
+    bool TryPlayLocalSound(std::string_view sound, uint32_t id);
+    // Lock-free invalidation; the worker removes only this request's queued data.
+    // id=0 cancels whichever request is current. In-flight writes still report any
+    // successful start before finished(false); busy lasts until those results arrive.
+    void CancelLocalSound(uint32_t id = 0);
+    bool IsLocalSoundBusy() const { return local_sound_active_generation_.load() != 0; }
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
@@ -185,21 +220,45 @@ private:
     // decode queue. Both queues must share this capacity so swap() is valid.
     static constexpr size_t kAudioTestingPacketCapacity =
         AUDIO_TESTING_MAX_DURATION_MS / OPUS_FRAME_DURATION_MS;
-    FixedQueue<std::unique_ptr<AudioStreamPacket>, kAudioTestingPacketCapacity> audio_decode_queue_;
+    FixedQueue<QueuedAudioPacket, kAudioTestingPacketCapacity> audio_decode_queue_;
     FixedQueue<std::unique_ptr<AudioStreamPacket>, MAX_SEND_PACKETS_IN_QUEUE> audio_send_queue_;
-    FixedQueue<std::unique_ptr<AudioStreamPacket>, kAudioTestingPacketCapacity>
-        audio_testing_queue_;
+    FixedQueue<QueuedAudioPacket, kAudioTestingPacketCapacity> audio_testing_queue_;
     FixedQueue<AudioTask, MAX_ENCODE_TASKS_IN_QUEUE> audio_encode_queue_;
     FixedQueue<AudioTask, MAX_PLAYBACK_TASKS_IN_QUEUE> audio_playback_queue_;
     bool decode_in_flight_ = false;
     bool output_in_flight_ = false;
     bool playback_drained_notified_ = true;
     uint32_t playback_generation_ = 0;
+    static constexpr size_t kLocalSoundMaxBytes = 64 * 1024;
+    static constexpr size_t kLocalSoundMaxPackets = 2000;
+    static constexpr int kLocalSoundMaxDurationMs = 10000;
+    // Stops further production/commits; not a hard abort of an in-flight driver call.
+    static constexpr int kLocalSoundTimeoutMs = 12000;
+    TaskHandle_t local_sound_task_handle_ = nullptr;
+    std::unique_ptr<uint8_t[]> local_sound_data_;
+    size_t local_sound_size_ = 0;
+    uint32_t local_sound_next_generation_ = 0;
+    std::atomic<uint32_t> local_sound_active_generation_{0};
+    std::atomic<uint32_t> local_sound_live_generation_{0};
+    std::atomic<uint32_t> local_sound_id_{0};
+    uint32_t local_sound_decoder_generation_ = 0;
+    std::chrono::steady_clock::time_point local_sound_deadline_;
+    size_t local_sound_pending_packets_ = 0;
+    bool local_sound_started_ = false;
+    bool local_sound_start_notified_ = false;
+    bool local_sound_failed_ = false;
+    std::atomic<uint32_t> capture_generation_{0};
+    std::atomic<bool> input_paused_{false};
+    // Lock order: control -> feed -> engine callback/input -> audio_queue.
+    // Never hold feed while waiting for codec input, AFE fetch or Opus encoding.
+    // Engine callbacks only enqueue/post events; they must not take control.
+    std::mutex capture_control_mutex_;
+    std::mutex capture_feed_mutex_;
     // For server AEC
     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
 
     bool audio_engine_initialized_ = false;
-    bool voice_detected_ = false;
+    std::atomic<bool> voice_detected_{false};
 #if CONFIG_USE_DEVICE_AEC
     bool device_aec_enabled_ = true;
 #else
@@ -221,6 +280,14 @@ private:
     void CheckAndUpdateAudioPowerState();
     bool IsPlaybackDrainedLocked() const;
     bool MarkPlaybackDrainedLocked();
+    void ResetCaptureLocked();
+    void LocalSoundTask();
+    bool IsLocalSoundCurrentLocked(uint32_t generation) const;
+    bool CommitLocalSoundPacket(std::unique_ptr<AudioStreamPacket> packet, uint32_t generation,
+                                std::chrono::steady_clock::time_point deadline);
+    void FinishLocalSoundPacketLocked(uint32_t generation, bool written);
+    void NotifyLocalSoundStartedLocked(uint32_t generation, std::unique_lock<std::mutex>& lock);
+    void RemoveLocalSoundPacketsLocked(uint32_t generation);
 };
 
 #endif

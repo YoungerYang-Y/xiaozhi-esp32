@@ -44,6 +44,7 @@ MqttProtocol::~MqttProtocol() {
 
     // Mark as dead first to prevent any pending scheduled tasks from executing
     *alive_ = false;
+    control_attempt_ = 0;
 
     if (reconnect_timer_ != nullptr) {
         esp_timer_stop(reconnect_timer_);
@@ -53,6 +54,7 @@ MqttProtocol::~MqttProtocol() {
     std::shared_ptr<Udp> udp;
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
+        AdvanceChannelToken();
         ++channel_generation_;
         probe_channel_.reset();
         udp = std::move(udp_);
@@ -81,6 +83,16 @@ MqttProtocol::~MqttProtocol() {
 bool MqttProtocol::Start() { return StartMqttClient(false); }
 
 bool MqttProtocol::StartMqttClient(bool report_error) {
+    const uint64_t attempt = next_control_attempt_.fetch_add(1) + 1;
+    uint64_t previous_attempt;
+    {
+        std::lock_guard<std::mutex> lock(channel_mutex_);
+        previous_attempt = control_attempt_.exchange(attempt);
+    }
+    if (previous_attempt != 0) {
+        EmitHealthEvent({HealthStage::Control, HealthOutcome::Retired, previous_attempt, 0});
+    }
+    EmitHealthEvent({HealthStage::Control, HealthOutcome::Started, attempt, 0});
     if (mqtt_ != nullptr) {
         ESP_LOGW(TAG, "Mqtt client already started");
         mqtt_.reset();
@@ -96,6 +108,7 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
 
     if (endpoint.empty()) {
         ESP_LOGW(TAG, "MQTT endpoint is not specified");
+        EmitHealthEvent({HealthStage::Control, HealthOutcome::Failed, attempt, 0});
         if (report_error) {
             SetError(Lang::Strings::SERVER_NOT_FOUND);
         }
@@ -104,9 +117,20 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
 
     auto network = Board::GetInstance().GetNetwork();
     mqtt_ = network->CreateMqtt(0);
+    if (mqtt_ == nullptr) {
+        EmitHealthEvent({HealthStage::Control, HealthOutcome::Failed, attempt, 0});
+        if (report_error) {
+            SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        }
+        return false;
+    }
     mqtt_->SetKeepAlive(keepalive_interval);
 
-    mqtt_->OnDisconnected([this]() {
+    mqtt_->OnDisconnected([this, attempt]() {
+        if (attempt != control_attempt_.load()) {
+            return;
+        }
+        EmitHealthEvent({HealthStage::Control, HealthOutcome::Failed, attempt, 0});
         if (on_disconnected_ != nullptr) {
             on_disconnected_();
         }
@@ -115,14 +139,36 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000);
     });
 
-    mqtt_->OnConnected([this]() {
+    mqtt_->OnConnected([this, attempt]() {
+        if (attempt != control_attempt_.load()) {
+            return;
+        }
+        // A consumer may have retired control evidence while Wi-Fi was down.
+        // Re-beginning this same client identity is intentionally idempotent.
+        EmitHealthEvent({HealthStage::Control, HealthOutcome::Started, attempt, 0});
+        EmitHealthEvent({HealthStage::Control, HealthOutcome::Succeeded, attempt, 0});
         if (on_connected_ != nullptr) {
             on_connected_();
         }
         esp_timer_stop(reconnect_timer_);
     });
 
-    mqtt_->OnMessage([this](const std::string& topic, const std::string& payload) {
+    mqtt_->OnMessage([this, attempt](const std::string& topic, const std::string& payload) {
+        if (attempt != control_attempt_.load()) {
+            return;
+        }
+        ChannelToken token;
+        uint64_t generation;
+        std::string current_session;
+        {
+            std::lock_guard<std::mutex> lock(channel_mutex_);
+            if (attempt != control_attempt_.load()) {
+                return;
+            }
+            token = channel_token();
+            generation = channel_generation_;
+            current_session = session_id();
+        }
         cJSON* root = cJSON_Parse(payload.c_str());
         if (root == nullptr) {
             ESP_LOGE(TAG, "Failed to parse json message %s", payload.c_str());
@@ -136,25 +182,43 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         }
 
         if (strcmp(type->valuestring, "hello") == 0) {
-            ParseServerHello(root);
+            ParseServerHello(root, token, attempt);
         } else if (strcmp(type->valuestring, "goodbye") == 0) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
-            ESP_LOGI(TAG, "Received goodbye message, session_id: %s",
-                     cJSON_IsString(session_id) ? session_id->valuestring : "null");
-            if (cJSON_IsString(session_id) && session_id_ == session_id->valuestring) {
+            if (cJSON_IsString(session_id) && current_session == session_id->valuestring) {
                 auto alive = alive_;  // Capture alive flag
-                Application::GetInstance().Schedule([this, alive]() {
+                Application::GetInstance().Schedule([this, alive, generation]() {
                     if (*alive) {
                         // Server initiated goodbye, don't send goodbye back to avoid ping-pong
-                        CloseAudioChannel(false);
+                        CloseAudioChannelForGeneration(false, generation);
                     }
                 });
             }
         } else if (on_incoming_json_ != nullptr) {
-            on_incoming_json_(root);
+#if CONFIG_WAVESHARE_1_85C_HOME
+            const bool conversation = strcmp(type->valuestring, "tts") == 0 ||
+                                      strcmp(type->valuestring, "stt") == 0 ||
+                                      strcmp(type->valuestring, "llm") == 0;
+            const auto session_id = cJSON_GetObjectItem(root, "session_id");
+            // MQTT control is shared across audio channels. Only an available root
+            // session ID can identify a late message that arrives after a reopen.
+            // Missing IDs retain compatibility, including MCP connection warmup.
+            if (conversation && cJSON_IsString(session_id) && session_id->valuestring[0] != '\0' &&
+                current_session != session_id->valuestring) {
+                ESP_LOGD(TAG, "Ignoring conversation message from another session");
+            } else
+#endif
+            {
+                on_incoming_json_(root, token);
+            }
         }
         cJSON_Delete(root);
-        last_incoming_time_ = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(channel_mutex_);
+            if (token == channel_token()) {
+                last_incoming_time_ = std::chrono::steady_clock::now();
+            }
+        }
     });
 
     std::string broker_address;
@@ -189,8 +253,11 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     if (auto connected = mqtt_->Connect(broker_address, broker_port, client_id, username, password);
         !connected) {
         ESP_LOGE(TAG, "Failed to connect to endpoint: %s", connected.error().ToString().c_str());
-        SetError(Lang::Strings::SERVER_NOT_CONNECTED,
-                 broker_address + ":" + std::to_string(broker_port));
+        EmitHealthEvent({HealthStage::Control, HealthOutcome::Failed, attempt, 0});
+        if (attempt == control_attempt_.load()) {
+            SetError(Lang::Strings::SERVER_NOT_CONNECTED,
+                     broker_address + ":" + std::to_string(broker_port));
+        }
         return false;
     }
 
@@ -202,9 +269,14 @@ bool MqttProtocol::SendText(const std::string& text) {
     if (publish_topic_.empty()) {
         return false;
     }
+    const auto attempt = control_attempt_.load();
+    const auto token = channel_token();
     if (!mqtt_->Publish(publish_topic_, text)) {
         ESP_LOGE(TAG, "Failed to publish message: %s", text.c_str());
-        SetError(Lang::Strings::SERVER_ERROR);
+        EmitHealthEvent({HealthStage::Control, HealthOutcome::Failed, attempt, 0});
+        if (attempt == control_attempt_.load() && token == channel_token()) {
+            SetError(Lang::Strings::SERVER_ERROR);
+        }
         return false;
     }
     return true;
@@ -219,6 +291,8 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     std::shared_ptr<Udp> udp;
     std::string nonce;
     uint32_t sequence;
+    ChannelToken source_token;
+    bool probe_enabled;
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
         if (udp_ == nullptr) {
@@ -231,6 +305,8 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         udp = udp_;
         nonce = aes_nonce_;
         sequence = htonl(++local_sequence_);
+        source_token = health_channel_token_;
+        probe_enabled = probe_channel_ != nullptr;
     }
 
     const uint16_t payload_len = htons(static_cast<uint16_t>(packet->payload.size()));
@@ -247,19 +323,49 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
                      packet->payload.size(), reinterpret_cast<const uint8_t*>(nonce.data()),
                      reinterpret_cast<uint8_t*>(&encrypted[nonce.size()]))) {
         ESP_LOGE(TAG, "Failed to encrypt audio data");
+        EmitHealthEvent(
+            {HealthStage::Media, HealthOutcome::Failed, source_token, source_token, probe_enabled});
         return false;
     }
 
     // Send without holding channel_mutex_ (see above).
-    return udp->Send(encrypted) > 0;
+    const bool sent = udp->Send(encrypted) > 0;
+    if (!sent) {
+        // The socket may belong to a channel retired while this blocking send ran.
+        // Only the identity-bearing evidence is safe; do not SetError on a new channel.
+        EmitHealthEvent(
+            {HealthStage::Media, HealthOutcome::Failed, source_token, source_token, probe_enabled});
+    }
+    return sent;
 }
 
 void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
-    awaiting_hello_ = false;
+    CloseAudioChannelForGeneration(send_goodbye, std::nullopt);
+}
+
+void MqttProtocol::CloseAudioChannelForGeneration(bool send_goodbye,
+                                                  std::optional<uint64_t> expected_generation) {
+    ChannelToken token;
+    ChannelToken retired_token;
+    bool retired_media;
+    bool retired_probe;
+    std::string closing_session;
     std::shared_ptr<Udp> udp;
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
+        if (expected_generation && *expected_generation != channel_generation_) {
+            return;
+        }
+        token = AdvanceChannelToken();
+        retired_token = health_channel_token_;
+        retired_media = media_started_;
+        retired_probe = probe_channel_ != nullptr;
+        health_channel_token_ = 0;
+        media_started_ = false;
         ++channel_generation_;
+        awaiting_hello_ = false;
+        hello_valid_ = false;
+        closing_session = session_id();
         probe_channel_.reset();
         if (probe_timer_ != nullptr) {
             esp_timer_stop(probe_timer_);
@@ -268,77 +374,138 @@ void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
     }
     udp.reset();
 
+    EmitHealthEvent({HealthStage::Handshake, HealthOutcome::Retired, retired_token, retired_token});
+    if (retired_media) {
+        EmitHealthEvent({HealthStage::Media, HealthOutcome::Retired, retired_token, retired_token,
+                         retired_probe});
+    }
+
     ESP_LOGI(TAG, "Closing audio channel, send_goodbye: %d", send_goodbye);
 
     // Only send goodbye when client initiates the close
     // Don't send if server already sent goodbye (to avoid ping-pong)
     if (send_goodbye) {
         std::string message = "{";
-        message += "\"session_id\":\"" + session_id_ + "\",";
+        message += "\"session_id\":\"" + closing_session + "\",";
         message += "\"type\":\"goodbye\"";
         message += "}";
         SendText(message);
     }
 
     if (on_audio_channel_closed_ != nullptr) {
-        on_audio_channel_closed_();
+        on_audio_channel_closed_(token);
     }
 }
 
 bool MqttProtocol::OpenAudioChannel() {
+    ChannelToken token;
+    ChannelToken retired_token;
+    bool retired_media;
+    bool retired_probe;
+    uint64_t generation;
+    std::shared_ptr<Udp> previous_udp;
+    {
+        std::lock_guard<std::mutex> lock(channel_mutex_);
+        token = AdvanceChannelToken();
+        retired_token = health_channel_token_;
+        retired_media = media_started_;
+        retired_probe = probe_channel_ != nullptr;
+        health_channel_token_ = token;
+        media_started_ = false;
+        generation = ++channel_generation_;
+        SetSessionId("");
+        awaiting_hello_ = false;
+        hello_valid_ = false;
+        probe_channel_.reset();
+        previous_udp = std::move(udp_);
+        if (probe_timer_ != nullptr) {
+            esp_timer_stop(probe_timer_);
+        }
+    }
+    previous_udp.reset();
+    EmitHealthEvent({HealthStage::Handshake, HealthOutcome::Retired, retired_token, retired_token});
+    if (retired_media) {
+        EmitHealthEvent({HealthStage::Media, HealthOutcome::Retired, retired_token, retired_token,
+                         retired_probe});
+    }
+    EmitHealthEvent({HealthStage::Handshake, HealthOutcome::Started, token, token});
     if (mqtt_ == nullptr || !mqtt_->IsConnected()) {
         ESP_LOGI(TAG, "MQTT is not connected, try to connect now");
         if (!StartMqttClient(true)) {
+            EmitHealthEvent({HealthStage::Handshake, HealthOutcome::Failed, token, token});
             return false;
         }
     }
 
     error_occurred_ = false;
-    session_id_ = "";
-    uint64_t generation;
-    std::shared_ptr<Udp> previous_udp;
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
-        generation = ++channel_generation_;
-        probe_channel_.reset();
-        previous_udp = std::move(udp_);
+        if (generation != channel_generation_) {
+            return false;
+        }
+        awaiting_hello_ = true;
+        xEventGroupClearBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
     }
-    previous_udp.reset();
-    if (probe_timer_ != nullptr) {
-        esp_timer_stop(probe_timer_);
-    }
-    hello_valid_ = false;
-    awaiting_hello_ = true;
-    xEventGroupClearBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
 
     auto message = GetHelloMessage();
     if (!SendText(message)) {
-        awaiting_hello_ = false;
+        {
+            std::lock_guard<std::mutex> lock(channel_mutex_);
+            if (generation == channel_generation_) {
+                awaiting_hello_ = false;
+            }
+        }
+        EmitHealthEvent({HealthStage::Handshake, HealthOutcome::Failed, token, token});
         return false;
     }
 
     // 等待服务器响应
     EventBits_t bits = xEventGroupWaitBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT,
                                            pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
-    awaiting_hello_ = false;
+    bool valid;
+    std::shared_ptr<ProbeChannel> probe;
+    std::string udp_server;
+    int udp_port;
+    {
+        std::lock_guard<std::mutex> lock(channel_mutex_);
+        if (generation != channel_generation_ || token != channel_token()) {
+            return false;
+        }
+        awaiting_hello_ = false;
+        valid = hello_valid_;
+        if (!(bits & MQTT_PROTOCOL_SERVER_HELLO_EVENT)) {
+            hello_valid_ = false;
+        }
+        probe = probe_channel_;
+        udp_server = udp_server_;
+        udp_port = udp_port_;
+    }
     if (!(bits & MQTT_PROTOCOL_SERVER_HELLO_EVENT)) {
         ESP_LOGE(TAG, "Failed to receive server hello");
+        EmitHealthEvent({HealthStage::Handshake, HealthOutcome::Failed, token, token});
         SetError(Lang::Strings::SERVER_TIMEOUT);
         return false;
     }
 
-    if (!hello_valid_) {
+    if (!valid) {
+        EmitHealthEvent({HealthStage::Handshake, HealthOutcome::Failed, token, token});
         SetError(Lang::Strings::SERVER_ERROR, "udp_probe negotiation failed");
         return false;
     }
     auto network = Board::GetInstance().GetNetwork();
     auto udp = network->CreateUdp(2);
-    std::shared_ptr<ProbeChannel> probe;
+    if (udp == nullptr) {
+        EmitHealthEvent(
+            {HealthStage::Media, HealthOutcome::Failed, token, token, probe != nullptr});
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
-        probe = probe_channel_;
+        if (generation != channel_generation_) {
+            return false;
+        }
     }
-    udp->OnMessage([this, generation, probe](const std::string& data) {
+    udp->OnMessage([this, generation, probe, token](const std::string& data) {
         // Record/claim PONG reception before any channel-lock wait. ReceivePong
         // checks the captured channel identity under that lock, including after
         // close/reopen, so the audio generation gate must not precede it.
@@ -346,9 +513,11 @@ bool MqttProtocol::OpenAudioChannel() {
             ReceivePong(probe, data);
             return;
         }
+        int sample_rate;
+        int frame_duration;
         {
             std::lock_guard<std::mutex> lock(channel_mutex_);
-            if (generation != channel_generation_) {
+            if (generation != channel_generation_ || token != channel_token()) {
                 return;
             }
         }
@@ -383,7 +552,8 @@ bool MqttProtocol::OpenAudioChannel() {
 
         {
             std::lock_guard<std::mutex> lock(channel_mutex_);
-            if (sequence <= remote_sequence_) {
+            if (generation != channel_generation_ || token != channel_token() ||
+                sequence <= remote_sequence_) {
                 ESP_LOGW(TAG, "Received duplicate/old audio sequence: %lu, last: %lu", sequence,
                          remote_sequence_);
                 return;
@@ -392,41 +562,51 @@ bool MqttProtocol::OpenAudioChannel() {
                 ESP_LOGW(TAG, "Received audio packet with wrong sequence: %lu, expected: %lu",
                          sequence, remote_sequence_ + 1);
             }
+            sample_rate = server_sample_rate_;
+            frame_duration = server_frame_duration_;
         }
 
         const size_t decrypted_size = payload_len;
         auto nonce = reinterpret_cast<const uint8_t*>(data.data());
         auto encrypted = reinterpret_cast<const uint8_t*>(data.data() + kAudioHeaderSize);
         auto packet = std::make_unique<AudioStreamPacket>();
-        packet->sample_rate = server_sample_rate_;
-        packet->frame_duration = server_frame_duration_;
+        packet->sample_rate = sample_rate;
+        packet->frame_duration = frame_duration;
         packet->timestamp = timestamp;
         packet->payload.resize(decrypted_size);
         if (!CryptAesCtr(encrypted, decrypted_size, nonce,
                          reinterpret_cast<uint8_t*>(packet->payload.data()))) {
             ESP_LOGE(TAG, "Failed to decrypt audio data");
+            EmitHealthEvent(
+                {HealthStage::Media, HealthOutcome::Failed, token, token, probe != nullptr});
             return;
         }
         {
             std::lock_guard<std::mutex> lock(channel_mutex_);
-            if (sequence <= remote_sequence_) {
+            if (generation != channel_generation_ || token != channel_token() ||
+                sequence <= remote_sequence_) {
                 return;
             }
             remote_sequence_ = sequence;
+            last_incoming_time_ = std::chrono::steady_clock::now();
         }
-        last_incoming_time_ = std::chrono::steady_clock::now();
         if (on_incoming_audio_ != nullptr) {
-            on_incoming_audio_(std::move(packet));
+            on_incoming_audio_(std::move(packet), token);
         }
     });
 
-    if (auto connected = udp->Connect(udp_server_, udp_port_); !connected) {
+    if (auto connected = udp->Connect(udp_server, udp_port); !connected) {
         ESP_LOGE(TAG, "Failed to connect UDP audio channel: %s",
                  connected.error().ToString().c_str());
+        EmitHealthEvent(
+            {HealthStage::Media, HealthOutcome::Failed, token, token, probe != nullptr});
         return false;
     }
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
+        if (generation != channel_generation_) {
+            return false;
+        }
         udp_ = std::move(udp);
     }
     if (probe != nullptr) {
@@ -441,6 +621,7 @@ bool MqttProtocol::OpenAudioChannel() {
                 .name = "udp_probe",
             };
             if (esp_timer_create(&args, &probe_timer_) != ESP_OK) {
+                EmitHealthEvent({HealthStage::Media, HealthOutcome::Failed, token, token, true});
                 CloseAudioChannel();
                 SetError(Lang::Strings::SERVER_ERROR, "udp_probe timer creation failed");
                 return false;
@@ -452,8 +633,11 @@ bool MqttProtocol::OpenAudioChannel() {
             return false;
         }
     }
+    if (token != channel_token()) {
+        return false;
+    }
     if (on_audio_channel_opened_ != nullptr) {
-        on_audio_channel_opened_();
+        on_audio_channel_opened_(token);
     }
     return true;
 }
@@ -478,15 +662,34 @@ std::string MqttProtocol::GetHelloMessage() {
     return message;
 }
 
-void MqttProtocol::ParseServerHello(const cJSON* root) {
-    if (!awaiting_hello_.exchange(false)) {
+void MqttProtocol::ParseServerHello(const cJSON* root, ChannelToken token,
+                                    uint64_t control_attempt) {
+    std::unique_lock<std::mutex> channel_lock(channel_mutex_);
+    if (token != channel_token() || control_attempt != control_attempt_.load() ||
+        !awaiting_hello_ || hello_valid_) {
         return;
     }
     // Always wake the opener, including malformed or unsupported responses.
     struct HelloCompletion {
-        EventGroupHandle_t events;
-        ~HelloCompletion() { xEventGroupSetBits(events, MQTT_PROTOCOL_SERVER_HELLO_EVENT); }
-    } completion{event_group_handle_};
+        MqttProtocol& protocol;
+        std::unique_lock<std::mutex>& lock;
+        ChannelToken token;
+        uint64_t control_attempt;
+        uint64_t generation;
+        ~HelloCompletion() {
+            if (!lock.owns_lock()) {
+                lock.lock();
+            }
+            // Health consumers run without this lock. Timeout/close/reopen may have
+            // retired the waiter in that interval; never set a newer opener's bit.
+            if (token == protocol.channel_token() &&
+                control_attempt == protocol.control_attempt_.load() &&
+                generation == protocol.channel_generation_ && protocol.awaiting_hello_) {
+                protocol.awaiting_hello_ = false;
+                xEventGroupSetBits(protocol.event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
+            }
+        }
+    } completion{*this, channel_lock, token, control_attempt, channel_generation_};
     auto features = cJSON_GetObjectItem(root, "features");
     auto capability = cJSON_GetObjectItem(features, "udp_probe");
     if ((features != nullptr && !cJSON_IsObject(features)) ||
@@ -503,8 +706,7 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
 
     auto session_id = cJSON_GetObjectItem(root, "session_id");
     if (cJSON_IsString(session_id)) {
-        session_id_ = session_id->valuestring;
-        ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
+        SetSessionId(session_id->valuestring);
     }
 
     // Get sample rate from hello message
@@ -596,16 +798,21 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
         ESP_LOGE(TAG, "Failed to import AES key, status: %ld", static_cast<long>(status));
         return;
     }
-    {
-        std::lock_guard<std::mutex> lock(channel_mutex_);
-        probe_channel_ = std::move(probe);
-        udp_server_ = udp_server;
-        udp_port_ = udp_port;
-        aes_nonce_ = std::move(aes_nonce);
-        local_sequence_ = 0;
-        remote_sequence_ = 0;
+    probe_channel_ = std::move(probe);
+    if (probe_channel_ != nullptr) {
+        probe_channel_->source_token = token;
     }
+    udp_server_ = udp_server;
+    udp_port_ = udp_port;
+    aes_nonce_ = std::move(aes_nonce);
+    local_sequence_ = 0;
+    remote_sequence_ = 0;
     hello_valid_ = true;
+    media_started_ = true;
+    channel_lock.unlock();
+    EmitHealthEvent({HealthStage::Handshake, HealthOutcome::Succeeded, token, token});
+    // Publish the negotiated mode before any socket creation, Connect, or fast PONG.
+    EmitHealthEvent({HealthStage::Media, HealthOutcome::Started, token, token, enable_probe});
 }
 
 bool MqttProtocol::CryptAesCtr(const uint8_t* input, size_t input_size, const uint8_t* nonce,
@@ -682,6 +889,7 @@ void MqttProtocol::ReceivePong(const std::shared_ptr<ProbeChannel>& channel,
     }
     int64_t elapsed_us;
     unsigned attempts;
+    ChannelToken source_token;
     {
         // Claim reception before taking the state lock so deadline processing cannot
         // overtake an already arriving response while its authentication is pending.
@@ -705,10 +913,13 @@ void MqttProtocol::ReceivePong(const std::shared_ptr<ProbeChannel>& channel,
         }
         elapsed_us = channel->probe.ElapsedUs(now);
         attempts = channel->probe.Attempts();
+        source_token = channel->source_token;
         channel->probe.Complete(now, esp_random() % (UdpProbe::kIntervalUs / 10 + 1));
         // Timer operations are non-blocking; the receive task never sends a PING.
         ArmProbeTimer(channel->probe.NextActionAt());
     }
+    EmitHealthEvent(
+        {HealthStage::Media, HealthOutcome::Succeeded, source_token, source_token, true});
     // Serial logging must not hold up channel state or timeout processing.
     if (attempts == 1) {
         ESP_LOGI(TAG, "UDP RTT: %lld.%03lld ms", static_cast<long long>(elapsed_us / 1000),
@@ -735,12 +946,16 @@ void MqttProtocol::ProcessPending() {
     std::string packet;
     bool failed = false;
     bool crypto_error = false;
+    ChannelToken source_token;
+    uint64_t generation;
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
         const auto channel = probe_channel_;
         if (channel == nullptr || udp_ == nullptr) {
             return;
         }
+        source_token = channel->source_token;
+        generation = channel_generation_;
         const auto now = esp_timer_get_time();
         if (channel->receiving_pong.load()) {
             // Give an already arriving PONG the opportunity to finish validation.
@@ -771,12 +986,23 @@ void MqttProtocol::ProcessPending() {
         }
     }
     if (failed) {
+        EmitHealthEvent(
+            {HealthStage::Media, HealthOutcome::Failed, source_token, source_token, true});
+        {
+            std::lock_guard<std::mutex> lock(channel_mutex_);
+            if (generation != channel_generation_) {
+                return;
+            }
+        }
         // Already on the main task; report and close directly, without another Schedule.
         SetError(crypto_error ? Lang::Strings::SERVER_ERROR : Lang::Strings::SERVER_TIMEOUT,
                  crypto_error ? "udp_probe_auth_error" : "udp_probe_timeout");
-        CloseAudioChannel();
+        CloseAudioChannelForGeneration(true, generation);
     } else if (udp != nullptr) {
         // A modem send may wait for AT, but never retain channel_mutex_ or wait for PONG.
-        udp->Send(packet);
+        if (udp->Send(packet) <= 0) {
+            EmitHealthEvent(
+                {HealthStage::Media, HealthOutcome::Failed, source_token, source_token, true});
+        }
     }
 }

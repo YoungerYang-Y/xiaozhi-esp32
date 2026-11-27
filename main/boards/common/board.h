@@ -11,10 +11,11 @@
 #include <esp_system.h>
 #include <cJSON.h>
 
-#include "led/led.h"
-#include "backlight.h"
-#include "camera.h"
 #include "assets.h"
+#include "backlight.h"
+#include "battery_status.h"
+#include "camera.h"
+#include "led/led.h"
 
 /**
  * Network events for unified callback
@@ -84,6 +85,7 @@ public:
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
+    virtual BatteryStatus GetBatteryStatus() const { return {}; }
     virtual std::string GetSystemInfoJson();
     static const char* ResetReasonName(esp_reset_reason_t reason);
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;

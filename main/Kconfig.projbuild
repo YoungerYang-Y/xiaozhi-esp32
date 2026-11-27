@@ -947,6 +947,38 @@ choice DISPLAY_ESP32S3_TOUCH_LCD_1_85C
 endchoice
 
 
+config WAVESHARE_1_85C_HOME
+    bool "Home firmware for Waveshare 1.85C Rev2.0"
+    depends on BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C && VERSION_2_0
+    default n
+    help
+        Local home variant. Keep fetching service configuration and activation
+        information, but skip automatic firmware installation at startup.
+
+config WAVESHARE_1_85C_HOME_NETWORK_ALERTS
+    bool "Stage-aware network alerts for the home variant"
+    depends on WAVESHARE_1_85C_HOME
+    select WAVESHARE_1_85C_HOME_LOCAL_ALERTS
+    default n
+    help
+        Distinguish Wi-Fi and voice-service failures, retain stage-specific
+        recovery evidence, and queue one local prompt per continuous failure.
+        Enable after the first-round hardware checks have passed.
+
+config WAVESHARE_1_85C_HOME_LOW_BATTERY_ALERTS
+    bool "Measured low-battery reminders for the home variant"
+    depends on WAVESHARE_1_85C_HOME
+    select WAVESHARE_1_85C_HOME_LOCAL_ALERTS
+    default n
+    help
+        Enable only after the paired battery thresholds, load behavior and
+        remaining operating time have been measured on the actual device.
+
+config WAVESHARE_1_85C_HOME_LOCAL_ALERTS
+    bool
+    depends on WAVESHARE_1_85C_HOME
+    default n
+
 choice DISPLAY_STYLE
     prompt "Select display style"
     default USE_DEFAULT_MESSAGE_STYLE

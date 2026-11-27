@@ -23,6 +23,7 @@ public:
     void EnableWakeWordDetection(bool enable) override;
     void EnableVoiceProcessing(bool enable) override;
     void EnableDeviceAec(bool enable) override;
+    void ResetCapture() override;
 
     bool HasWakeWord() const override;
     bool IsWakeWordDetectionEnabled() const override;

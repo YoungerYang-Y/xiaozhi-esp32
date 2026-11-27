@@ -1,6 +1,8 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <algorithm>
 #include <cstring>
+#include <new>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
     (esp_ae_rate_cvt_cfg_t) {                                                                \
@@ -28,6 +30,14 @@
 AudioService::AudioService() { event_group_ = xEventGroupCreate(); }
 
 AudioService::~AudioService() {
+    // The optional worker owns a copy of the Ogg buffer and may still be parsing it.
+    service_stopped_.store(true);
+    CancelLocalSound();
+    {
+        std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        audio_queue_cv_.notify_all();
+        audio_queue_cv_.wait(lock, [this] { return local_sound_task_handle_ == nullptr; });
+    }
     if (event_group_ != nullptr) {
         vEventGroupDelete(event_group_);
     }
@@ -88,12 +98,18 @@ void AudioService::Initialize(AudioCodec* codec) {
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
     audio_engine_->OnVadStateChange([this](bool speaking) {
+        if (input_paused_.load()) {
+            return;
+        }
         voice_detected_ = speaking;
         if (callbacks_.on_vad_change) {
             callbacks_.on_vad_change(speaking);
         }
     });
     audio_engine_->OnWakeWordDetected([this](const std::string& wake_word) {
+        if (input_paused_.load()) {
+            return;
+        }
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
         if (callbacks_.on_wake_word_detected) {
             callbacks_.on_wake_word_detected(wake_word);
@@ -173,6 +189,8 @@ void AudioService::Start() {
 void AudioService::Stop() {
     esp_timer_stop(audio_power_timer_);
     service_stopped_.store(true);
+    CancelLocalSound();
+    ResetCapture();
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                                          AS_EVENT_AUDIO_PROCESSOR_RUNNING);
 
@@ -180,6 +198,7 @@ void AudioService::Stop() {
     {
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
         ++playback_generation_;
+        RemoveLocalSoundPacketsLocked(local_sound_active_generation_.load());
         audio_encode_queue_.clear();
         audio_decode_queue_.clear();
         audio_playback_queue_.clear();
@@ -193,6 +212,10 @@ void AudioService::Stop() {
 }
 
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
+    const uint32_t generation = capture_generation_.load();
+    if (input_paused_.load()) {
+        return false;
+    }
     if (!codec_->input_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -206,6 +229,9 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
         }
         if (input_resampler_ != nullptr) {
             std::lock_guard<std::mutex> lock(input_resampler_mutex_);
+            if (generation != capture_generation_.load() || input_paused_.load()) {
+                return false;
+            }
             uint32_t in_sample_num = data.size() / codec_->input_channels();
             uint32_t output_samples = 0;
             esp_ae_rate_cvt_get_max_out_sample_num(input_resampler_, in_sample_num,
@@ -224,11 +250,19 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
         }
     }
 
+    if (generation != capture_generation_.load() || input_paused_.load()) {
+        return false;
+    }
+
     /* Update the last input time */
     last_input_time_ = std::chrono::steady_clock::now();
     debug_statistics_.input_count++;
 
 #if CONFIG_USE_AUDIO_DEBUGGER
+    std::lock_guard<std::mutex> feed_lock(capture_feed_mutex_);
+    if (generation != capture_generation_.load() || input_paused_.load()) {
+        return false;
+    }
     // 音频调试：发送原始音频数据
     if (audio_debugger_ == nullptr) {
         audio_debugger_ = std::make_unique<AudioDebugger>();
@@ -278,6 +312,11 @@ void AudioService::AudioInputTask() {
             continue;
         }
 
+        const uint32_t capture_generation = capture_generation_.load();
+        if (input_paused_.load()) {
+            continue;
+        }
+
         /* Used for audio testing in NetworkConfiguring mode by clicking the BOOT button */
         if (bits & AS_EVENT_AUDIO_TESTING_RUNNING) {
             bool testing_queue_full = false;
@@ -293,6 +332,11 @@ void AudioService::AudioInputTask() {
             std::vector<int16_t> data;
             int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
             if (ReadAudioData(data, 16000, samples)) {
+                std::lock_guard<std::mutex> feed_lock(capture_feed_mutex_);
+                if (capture_generation != capture_generation_.load() || input_paused_.load() ||
+                    !(xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_TESTING_RUNNING)) {
+                    continue;
+                }
                 // If input channels is 2, we need to fetch the left channel data
                 if (codec_->input_channels() == 2) {
                     auto mono_data = std::vector<int16_t>(data.size() / 2);
@@ -311,6 +355,12 @@ void AudioService::AudioInputTask() {
             int samples = 160;  // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
+                std::lock_guard<std::mutex> feed_lock(capture_feed_mutex_);
+                if (capture_generation != capture_generation_.load() || input_paused_.load() ||
+                    !(xEventGroupGetBits(event_group_) &
+                      (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING))) {
+                    continue;
+                }
                 audio_engine_->Feed(std::move(data));
                 continue;
             }
@@ -337,6 +387,44 @@ void AudioService::AudioOutputTask() {
         output_in_flight_ = true;
         audio_queue_cv_.notify_all();
         lock.unlock();
+
+        if (task.local_sound_generation != 0) {
+            lock.lock();
+            bool current = IsLocalSoundCurrentLocked(task.local_sound_generation) &&
+                           task.playback_generation == playback_generation_;
+            lock.unlock();
+            bool written = false;
+            if (current) {
+                if (!codec_->GetOutputVolumeStatus().applied) {
+                    esp_timer_stop(audio_power_timer_);
+                    esp_timer_start_periodic(audio_power_timer_,
+                                             AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+                    codec_->EnableOutput(true);
+                }
+                // Hardware open may have blocked. Recheck cancellation before writing.
+                lock.lock();
+                current = IsLocalSoundCurrentLocked(task.local_sound_generation) &&
+                          task.playback_generation == playback_generation_;
+                lock.unlock();
+                if (current) {
+                    written = codec_->OutputDataChecked(task.pcm);
+                }
+            }
+            lock.lock();
+            FinishLocalSoundPacketLocked(task.local_sound_generation, written);
+            output_in_flight_ = false;
+            if (written) {
+                last_output_time_ = std::chrono::steady_clock::now();
+                ++debug_statistics_.playback_count;
+            }
+            const bool notify_drained = MarkPlaybackDrainedLocked();
+            audio_queue_cv_.notify_all();
+            lock.unlock();
+            if (notify_drained && callbacks_.on_playback_drained) {
+                callbacks_.on_playback_drained();
+            }
+            continue;
+        }
 
         if (!codec_->output_enabled()) {
             esp_timer_stop(audio_power_timer_);
@@ -379,6 +467,8 @@ void AudioService::AudioOutputTask() {
 }
 
 void AudioService::OpusCodecTask() {
+    uint32_t encoder_generation = 0;
+    bool encoder_needs_reset = true;
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.wait(lock, [this]() {
@@ -405,6 +495,8 @@ void AudioService::OpusCodecTask() {
             task.timestamp = packet->timestamp;
             task.playback_id = packet->playback_id;
             task.media_position_ms = packet->media_position_ms;
+            task.local_sound_generation = packet.local_sound_generation;
+            task.playback_generation = generation;
 
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
             bool decoded = false;
@@ -449,14 +541,28 @@ void AudioService::OpusCodecTask() {
             }
 
             lock.lock();
-            if (decoded && generation == playback_generation_ && !service_stopped_.load()) {
+            uint64_t decoded_source_token = 0;
+            uint64_t decoded_source_request = 0;
+            if (decoded && generation == playback_generation_ && !service_stopped_.load() &&
+                (task.local_sound_generation == 0 ||
+                 IsLocalSoundCurrentLocked(task.local_sound_generation))) {
+                if (!task.pcm.empty() && task.local_sound_generation == 0 &&
+                    packet->playback_id == 0) {
+                    decoded_source_token = packet->source_channel_token;
+                    decoded_source_request = packet->source_request_id;
+                }
                 audio_playback_queue_.push_back(std::move(task));
+            } else if (task.local_sound_generation != 0) {
+                FinishLocalSoundPacketLocked(task.local_sound_generation, false);
             }
             decode_in_flight_ = false;
             debug_statistics_.decode_count++;
             const bool notify_drained = MarkPlaybackDrainedLocked();
             audio_queue_cv_.notify_all();
             lock.unlock();
+            if (decoded_source_token != 0 && callbacks_.on_incoming_audio_decoded) {
+                callbacks_.on_incoming_audio_decoded(decoded_source_token, decoded_source_request);
+            }
             if (notify_drained && callbacks_.on_playback_drained) {
                 callbacks_.on_playback_drained();
             }
@@ -475,6 +581,13 @@ void AudioService::OpusCodecTask() {
             packet->timestamp = task.timestamp;
 
             if (opus_encoder_ != nullptr && task.pcm.size() == encoder_frame_size_) {
+                if (encoder_needs_reset || encoder_generation != task.capture_generation) {
+                    // Only the codec task touches the encoder. Reset here rather
+                    // than racing an in-flight encode from the main task.
+                    esp_opus_enc_reset(opus_encoder_);
+                    encoder_generation = task.capture_generation;
+                    encoder_needs_reset = false;
+                }
                 packet->payload.resize(encoder_outbuf_size_);
                 esp_audio_enc_in_frame_t in = {
                     .buffer = (uint8_t*)(task.pcm.data()),
@@ -492,6 +605,10 @@ void AudioService::OpusCodecTask() {
                     if (task.type == kAudioTaskTypeEncodeToSendQueue) {
                         {
                             std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
+                            if (task.capture_generation != capture_generation_.load() ||
+                                input_paused_.load() || service_stopped_.load()) {
+                                continue;
+                            }
                             /* Never let a full send queue stall encoding: stale realtime
                              * audio is useless to the server, so drop the oldest packet. */
                             if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
@@ -506,6 +623,10 @@ void AudioService::OpusCodecTask() {
                         bool testing_queue_full = false;
                         {
                             std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
+                            if (task.capture_generation != capture_generation_.load() ||
+                                input_paused_.load() || service_stopped_.load()) {
+                                continue;
+                            }
                             testing_queue_full = !audio_testing_queue_.push_back(std::move(packet));
                         }
                         if (testing_queue_full && callbacks_.on_audio_testing_queue_full) {
@@ -576,6 +697,11 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
         /* Push the task to the encode queue */
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
 
+        if (input_paused_.load() || service_stopped_.load()) {
+            return;
+        }
+        task.capture_generation = capture_generation_.load();
+
         /* If the task is to send queue, we need to set the timestamp */
         if (type == kAudioTaskTypeEncodeToSendQueue && !timestamp_queue_.empty()) {
             task.timestamp = timestamp_queue_.front();
@@ -640,6 +766,10 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
 }
 
 void AudioService::EncodeWakeWord() {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
+    if (input_paused_.load()) {
+        return;
+    }
     if (audio_engine_) {
         audio_engine_->EncodeWakeWordData();
     }
@@ -655,14 +785,22 @@ std::vector<std::string> AudioService::GetWakeWords() const {
 }
 
 std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
+    const uint32_t generation = capture_generation_.load();
     auto packet = std::make_unique<AudioStreamPacket>();
     if (audio_engine_ && audio_engine_->GetWakeWordOpus(packet->payload)) {
-        return packet;
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        if (!input_paused_.load() && generation == capture_generation_.load()) {
+            return packet;
+        }
     }
     return nullptr;
 }
 
 void AudioService::EnableWakeWordDetection(bool enable) {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
+    if (enable && input_paused_.load()) {
+        return;
+    }
     ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
     if (enable) {
         if (!InitializeAudioEngine()) {
@@ -697,6 +835,7 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 }
 
 void AudioService::ReleaseWakeWordResources() {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
 #if !(CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31)
     if (!audio_engine_initialized_) {
         return;
@@ -711,6 +850,10 @@ void AudioService::ReleaseWakeWordResources() {
 }
 
 void AudioService::EnableVoiceProcessing(bool enable) {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
+    if (enable && input_paused_.load()) {
+        return;
+    }
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
 
     if (enable) {
@@ -731,11 +874,18 @@ void AudioService::EnableVoiceProcessing(bool enable) {
         if (audio_engine_initialized_) {
             audio_engine_->EnableVoiceProcessing(false);
         }
+        // Engine disable fences its VAD callbacks. Retire the last observation
+        // only after that barrier so it cannot outlive the capture generation.
+        voice_detected_.store(false);
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     }
 }
 
 void AudioService::EnableAudioTesting(bool enable) {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
+    if (input_paused_.load()) {
+        return;
+    }
     ESP_LOGI(TAG, "%s audio testing", enable ? "Enabling" : "Disabling");
     if (enable) {
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);
@@ -743,6 +893,8 @@ void AudioService::EnableAudioTesting(bool enable) {
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);
         /* Copy audio_testing_queue_ to audio_decode_queue_ */
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        CancelLocalSound();
+        RemoveLocalSoundPacketsLocked(local_sound_active_generation_.load());
         audio_decode_queue_.clear();
         audio_decode_queue_.swap(audio_testing_queue_);
         if (!audio_decode_queue_.empty()) {
@@ -750,6 +902,44 @@ void AudioService::EnableAudioTesting(bool enable) {
         }
         audio_queue_cv_.notify_all();
     }
+}
+
+void AudioService::SetInputPaused(bool paused) {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
+    input_paused_.store(paused);
+    if (paused) {
+        ResetCaptureLocked();
+    }
+}
+
+void AudioService::ResetCapture() {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
+    ResetCaptureLocked();
+}
+
+void AudioService::ResetCaptureLocked() {
+    std::lock_guard<std::mutex> feed_lock(capture_feed_mutex_);
+    xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
+                                           AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+    if (audio_engine_initialized_) {
+        audio_engine_->ResetCapture();
+    }
+    // The engine fence completes old callbacks before the queue generation
+    // changes. A read already in progress is rejected at its feed boundary.
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        capture_generation_.fetch_add(1);
+        audio_encode_queue_.clear();
+        audio_send_queue_.clear();
+        audio_testing_queue_.clear();
+        timestamp_queue_.clear();
+        audio_queue_cv_.notify_all();
+    }
+    voice_detected_ = false;
+    audio_input_need_warmup_ = false;
+    // ADC start/stop belongs to the input task. Do not stop hardware from here
+    // or wait for a currently blocked read to finish.
+    xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
 }
 
 void AudioService::EnableDeviceAec(bool enable) {
@@ -764,6 +954,267 @@ void AudioService::EnableDeviceAec(bool enable) {
 }
 
 void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) { callbacks_ = callbacks; }
+
+bool AudioService::TryPlayLocalSound(std::string_view sound, uint32_t id) {
+    if (id == 0 || sound.empty() || sound.size() > kLocalSoundMaxBytes || codec_ == nullptr ||
+        !codec_->SupportsCheckedOutput() || service_stopped_.load()) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || IsLocalSoundBusy() || !IsPlaybackDrainedLocked() ||
+        service_stopped_.load()) {
+        return false;
+    }
+    auto data = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[sound.size()]);
+    if (!data) {
+        return false;
+    }
+    std::memcpy(data.get(), sound.data(), sound.size());
+    local_sound_data_ = std::move(data);
+    local_sound_size_ = sound.size();
+    local_sound_decoder_generation_ = playback_generation_;
+    local_sound_deadline_ =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kLocalSoundTimeoutMs);
+    local_sound_pending_packets_ = 0;
+    local_sound_started_ = false;
+    local_sound_start_notified_ = false;
+    local_sound_failed_ = false;
+    if (++local_sound_next_generation_ == 0) {
+        ++local_sound_next_generation_;
+    }
+    local_sound_live_generation_.store(local_sound_next_generation_);
+    local_sound_id_.store(id);
+    local_sound_active_generation_.store(local_sound_next_generation_);
+    if (local_sound_task_handle_ == nullptr &&
+        xTaskCreate(
+            [](void* arg) {
+                static_cast<AudioService*>(arg)->LocalSoundTask();
+                vTaskDelete(nullptr);
+            },
+            "local_sound", 4096, this, 2, &local_sound_task_handle_) != pdPASS) {
+        local_sound_active_generation_.store(0);
+        local_sound_live_generation_.store(0);
+        local_sound_data_.reset();
+        return false;
+    }
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+void AudioService::CancelLocalSound(uint32_t id) {
+    auto generation = local_sound_active_generation_.load();
+    if (generation != 0 && (id == 0 || id == local_sound_id_.load()) &&
+        generation == local_sound_active_generation_.load()) {
+        // A delayed cancel for a retired generation cannot overwrite cancellation
+        // of a newer request, even when the caller reuses its public id.
+        local_sound_live_generation_.compare_exchange_strong(generation, 0);
+        audio_queue_cv_.notify_all();
+    }
+}
+
+bool AudioService::IsLocalSoundCurrentLocked(uint32_t generation) const {
+    return generation != 0 && generation == local_sound_active_generation_.load() &&
+           generation == local_sound_live_generation_.load() && !local_sound_failed_ &&
+           local_sound_decoder_generation_ == playback_generation_ && !service_stopped_.load() &&
+           std::chrono::steady_clock::now() < local_sound_deadline_;
+}
+
+bool AudioService::CommitLocalSoundPacket(std::unique_ptr<AudioStreamPacket> packet,
+                                          uint32_t generation,
+                                          std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    while (true) {
+        NotifyLocalSoundStartedLocked(generation, lock);
+        if (!IsLocalSoundCurrentLocked(generation) ||
+            std::chrono::steady_clock::now() >= deadline) {
+            auto live_generation = generation;
+            local_sound_live_generation_.compare_exchange_strong(live_generation, 0);
+            return false;
+        }
+        // Cancel is lock-free, so its notify can race the condition variable's
+        // unlock/wait boundary. A short bounded poll closes that lost-wakeup gap.
+        const auto wake =
+            std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
+        if (!audio_queue_cv_.wait_until(lock, wake, [this, generation] {
+                return !IsLocalSoundCurrentLocked(generation) ||
+                       (local_sound_started_ && !local_sound_start_notified_) ||
+                       audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
+            })) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                auto live_generation = generation;
+                local_sound_live_generation_.compare_exchange_strong(live_generation, 0);
+                return false;
+            }
+            continue;
+        }
+        if (!IsLocalSoundCurrentLocked(generation)) {
+            return false;
+        }
+        if (audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE) {
+            break;
+        }
+    }
+    // Producer and decoder generations are checked under the commit lock. A reset
+    // between parsing and this commit cannot put an old packet into a new stream.
+    audio_decode_queue_.push_back(QueuedAudioPacket(std::move(packet), generation));
+    ++local_sound_pending_packets_;
+    playback_drained_notified_ = false;
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+void AudioService::NotifyLocalSoundStartedLocked(uint32_t generation,
+                                                 std::unique_lock<std::mutex>& lock) {
+    if (local_sound_started_ && !local_sound_start_notified_ &&
+        generation == local_sound_active_generation_.load()) {
+        local_sound_start_notified_ = true;
+        const auto id = local_sound_id_.load();
+        lock.unlock();
+        if (callbacks_.on_local_sound_started) {
+            callbacks_.on_local_sound_started(id);
+        }
+        lock.lock();
+    }
+}
+
+void AudioService::FinishLocalSoundPacketLocked(uint32_t generation, bool written) {
+    if (generation != local_sound_active_generation_.load()) {
+        return;
+    }
+    if (local_sound_pending_packets_ > 0) {
+        --local_sound_pending_packets_;
+    }
+    // This is an observed write result, independent of permission to write again.
+    // Keep the request alive through every in-flight result, even after cancel/reset.
+    if (written) {
+        local_sound_started_ = true;
+    } else {
+        local_sound_failed_ = true;
+        auto live_generation = generation;
+        local_sound_live_generation_.compare_exchange_strong(live_generation, 0);
+    }
+}
+
+void AudioService::RemoveLocalSoundPacketsLocked(uint32_t generation) {
+    if (generation == 0 || generation != local_sound_active_generation_.load()) {
+        return;
+    }
+    // Rotate fixed queues in place: cancellation never clears another producer.
+    for (size_t remaining = audio_decode_queue_.size(); remaining > 0; --remaining) {
+        auto packet = std::move(audio_decode_queue_.front());
+        audio_decode_queue_.pop_front();
+        if (packet.local_sound_generation != generation) {
+            audio_decode_queue_.push_back(std::move(packet));
+        } else if (local_sound_pending_packets_ > 0) {
+            --local_sound_pending_packets_;
+        }
+    }
+    for (size_t remaining = audio_playback_queue_.size(); remaining > 0; --remaining) {
+        auto task = std::move(audio_playback_queue_.front());
+        audio_playback_queue_.pop_front();
+        if (task.local_sound_generation != generation) {
+            audio_playback_queue_.push_back(std::move(task));
+        } else if (local_sound_pending_packets_ > 0) {
+            --local_sound_pending_packets_;
+        }
+    }
+    audio_queue_cv_.notify_all();
+}
+
+void AudioService::LocalSoundTask() {
+    while (true) {
+        std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        audio_queue_cv_.wait(lock,
+                             [this] { return service_stopped_.load() || IsLocalSoundBusy(); });
+        if (service_stopped_.load() && !IsLocalSoundBusy()) {
+            // Retire this handle before releasing the exit-decision lock. A
+            // concurrent Start/admission can now create a replacement safely.
+            local_sound_task_handle_ = nullptr;
+            audio_queue_cv_.notify_all();
+            return;
+        }
+        const auto generation = local_sound_active_generation_.load();
+        const auto id = local_sound_id_.load();
+        const auto deadline = local_sound_deadline_;
+        const auto* data = local_sound_data_.get();
+        const auto size = local_sound_size_;
+        lock.unlock();
+
+        // Validate the entire bounded input before producing audible data. No
+        // partially parsed, truncated or overlong prompt is allowed to start.
+        auto demuxer = std::make_unique<OggDemuxer>();
+        size_t packet_count = 0;
+        int duration_ms = 0;
+        bool valid = true;
+        demuxer->OnPacket([&](const uint8_t*, int, int duration, size_t) {
+            valid = valid && AS_OPUS_GET_FRAME_DRU_ENUM(duration) >= 0 &&
+                    ++packet_count <= kLocalSoundMaxPackets &&
+                    (duration_ms += duration) <= kLocalSoundMaxDurationMs;
+        });
+        demuxer->Process(data, size);
+        valid = valid && demuxer->Finish() && packet_count > 0;
+        // Volume inspection can take the codec lock; it never runs on the caller.
+        const auto volume = codec_->GetOutputVolumeStatus();
+        valid = valid && volume.volume > 0;
+        if (valid) {
+            demuxer->Reset();
+            demuxer->OnPacket([&](const uint8_t* bytes, int rate, int duration, size_t count) {
+                if (!valid) {
+                    return;
+                }
+                auto packet = std::make_unique<AudioStreamPacket>();
+                packet->sample_rate = rate;
+                packet->frame_duration = duration;
+                packet->payload.assign(bytes, bytes + count);
+                valid = CommitLocalSoundPacket(std::move(packet), generation, deadline);
+            });
+            demuxer->Process(data, size);
+        }
+
+        lock.lock();
+        bool withdrawn = false;
+        while (true) {
+            if (!valid || !IsLocalSoundCurrentLocked(generation)) {
+                valid = false;
+                if (!withdrawn) {
+                    // Revoke before any callback/wait. An in-flight decoder may
+                    // finish later, but can no longer commit PCM for this request.
+                    auto live_generation = generation;
+                    local_sound_live_generation_.compare_exchange_strong(live_generation, 0);
+                    RemoveLocalSoundPacketsLocked(generation);
+                    withdrawn = true;
+                }
+            }
+            NotifyLocalSoundStartedLocked(generation, lock);
+            if (local_sound_pending_packets_ == 0) {
+                break;
+            }
+            // The production deadline does not fabricate completion while a driver
+            // call is still in flight. Keep the old request's identity and receipts.
+            const auto next_poll = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+            audio_queue_cv_.wait_until(lock, withdrawn ? next_poll : std::min(deadline, next_poll));
+        }
+        auto live_generation = generation;
+        const bool completed =
+            valid && IsLocalSoundCurrentLocked(generation) && local_sound_started_ &&
+            local_sound_pending_packets_ == 0 && std::chrono::steady_clock::now() < deadline &&
+            local_sound_live_generation_.compare_exchange_strong(live_generation, 0);
+        if (!completed) {
+            live_generation = generation;
+            local_sound_live_generation_.compare_exchange_strong(live_generation, 0);
+        }
+        lock.unlock();
+        if (callbacks_.on_local_sound_finished) {
+            callbacks_.on_local_sound_finished(id, completed);
+        }
+        lock.lock();
+        // Keep admission closed until all receipts for this id have returned.
+        local_sound_data_.reset();
+        local_sound_live_generation_.store(0);
+        local_sound_active_generation_.store(0);
+        audio_queue_cv_.notify_all();
+    }
+}
 
 void AudioService::PlaySound(const std::string_view& ogg) {
     if (!codec_->output_enabled()) {
@@ -803,7 +1254,9 @@ void AudioService::ResetDecoder() {
     bool notify_drained = false;
     {
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        CancelLocalSound();
         ++playback_generation_;
+        RemoveLocalSoundPacketsLocked(local_sound_active_generation_.load());
         std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
         if (opus_decoder_ != nullptr) {
             esp_opus_dec_reset(opus_decoder_);

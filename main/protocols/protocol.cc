@@ -34,20 +34,20 @@ void Protocol::AddClientCapabilities(cJSON* root, bool include_text_font) {
     cJSON_AddNumberToObject(font, "bpp", capability.bpp);
 }
 
-void Protocol::OnIncomingJson(std::function<void(const cJSON* root)> callback) {
+void Protocol::OnIncomingJson(std::function<void(const cJSON* root, ChannelToken)> callback) {
     on_incoming_json_ = callback;
 }
 
 void Protocol::OnIncomingAudio(
-    std::function<void(std::unique_ptr<AudioStreamPacket> packet)> callback) {
+    std::function<void(std::unique_ptr<AudioStreamPacket> packet, ChannelToken)> callback) {
     on_incoming_audio_ = callback;
 }
 
-void Protocol::OnAudioChannelOpened(std::function<void()> callback) {
+void Protocol::OnAudioChannelOpened(std::function<void(ChannelToken)> callback) {
     on_audio_channel_opened_ = callback;
 }
 
-void Protocol::OnAudioChannelClosed(std::function<void()> callback) {
+void Protocol::OnAudioChannelClosed(std::function<void(ChannelToken)> callback) {
     on_audio_channel_closed_ = callback;
 }
 
@@ -58,6 +58,26 @@ void Protocol::OnNetworkError(std::function<void(const std::string& message)> ca
 void Protocol::OnConnected(std::function<void()> callback) { on_connected_ = callback; }
 
 void Protocol::OnDisconnected(std::function<void()> callback) { on_disconnected_ = callback; }
+
+void Protocol::OnHealthEvent(std::function<void(const HealthEvent&)> callback) {
+    on_health_event_ = std::move(callback);
+}
+
+void Protocol::EmitHealthEvent(const HealthEvent& event) {
+    if (event.attempt_id != 0 && on_health_event_ != nullptr) {
+        on_health_event_(event);
+    }
+}
+
+std::string Protocol::session_id() const {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    return session_id_;
+}
+
+void Protocol::SetSessionId(const std::string& session_id) {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    session_id_ = session_id;
+}
 
 void Protocol::SetError(const std::string& message) {
     error_occurred_ = true;
@@ -75,7 +95,7 @@ void Protocol::SetError(const std::string& message, const std::string& detail) {
 }
 
 void Protocol::SendAbortSpeaking(AbortReason reason) {
-    std::string message = "{\"session_id\":\"" + session_id_ + "\",\"type\":\"abort\"";
+    std::string message = "{\"session_id\":\"" + session_id() + "\",\"type\":\"abort\"";
     if (reason == kAbortReasonWakeWordDetected) {
         message += ",\"reason\":\"wake_word_detected\"";
     }
@@ -84,14 +104,14 @@ void Protocol::SendAbortSpeaking(AbortReason reason) {
 }
 
 void Protocol::SendWakeWordDetected(const std::string& wake_word) {
-    std::string json = "{\"session_id\":\"" + session_id_ +
+    std::string json = "{\"session_id\":\"" + session_id() +
                        "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + wake_word +
                        "\"}";
     SendText(json);
 }
 
 void Protocol::SendStartListening(ListeningMode mode) {
-    std::string message = "{\"session_id\":\"" + session_id_ + "\"";
+    std::string message = "{\"session_id\":\"" + session_id() + "\"";
     message += ",\"type\":\"listen\",\"state\":\"start\"";
     if (mode == kListeningModeRealtime) {
         message += ",\"mode\":\"realtime\"";
@@ -106,13 +126,13 @@ void Protocol::SendStartListening(ListeningMode mode) {
 
 void Protocol::SendStopListening() {
     std::string message =
-        "{\"session_id\":\"" + session_id_ + "\",\"type\":\"listen\",\"state\":\"stop\"}";
+        "{\"session_id\":\"" + session_id() + "\",\"type\":\"listen\",\"state\":\"stop\"}";
     SendText(message);
 }
 
 void Protocol::SendMcpMessage(const std::string& payload) {
     std::string message =
-        "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
+        "{\"session_id\":\"" + session_id() + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
     SendText(message);
 }
 

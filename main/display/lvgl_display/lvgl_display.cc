@@ -1,8 +1,11 @@
 #include <esp_err.h>
 #include <esp_log.h>
 #include <material_symbols.h>
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 
 #include "application.h"
@@ -48,7 +51,6 @@ bool LvglDisplay::SetTextFont(std::shared_ptr<LvglFont> text_font) {
     if (text_font == nullptr || text_font->font() == nullptr) {
         return false;
     }
-
     DisplayLockGuard lock(this);
     auto& theme_manager = LvglThemeManager::GetInstance();
     auto light_theme = theme_manager.GetTheme("light");
@@ -56,6 +58,60 @@ bool LvglDisplay::SetTextFont(std::shared_ptr<LvglFont> text_font) {
     if (light_theme == nullptr && dark_theme == nullptr) {
         return false;
     }
+#if CONFIG_WAVESHARE_1_85C_HOME
+    // Keep a centered Wi-Fi column and matching side columns, including
+    // proportional digits. Reject a font before changing either theme.
+    const auto font = text_font->font();
+    if (font->line_height == 0 || font->line_height > 44) {
+        return false;
+    }
+    lv_point_t volume_size{}, unknown_size;
+    for (int value = 0; value <= 100; ++value) {
+        char text[4];
+        std::snprintf(text, sizeof(text), "%d", value);
+        lv_point_t size;
+        lv_text_get_size(&size, text, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        volume_size.x = std::max(volume_size.x, size.x);
+    }
+    lv_text_get_size(&unknown_size, "?", font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    if (unknown_size.x > 44) {
+        return false;
+    }
+    auto clock_fits = [font](const char* text) {
+        lv_point_t size;
+        lv_text_get_size(&size, text, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        return size.x <= 160;
+    };
+    if (!clock_fits("--:--")) {
+        return false;
+    }
+    // Include proportional digits and kerning before accepting either theme.
+    for (int hour = 0; hour < 24; ++hour) {
+        for (int minute = 0; minute < 60; ++minute) {
+            char clock[6];
+            std::snprintf(clock, sizeof(clock), "%02d:%02d", hour, minute);
+            if (!clock_fits(clock)) {
+                return false;
+            }
+        }
+    }
+    for (auto theme : {light_theme, dark_theme}) {
+        if (theme == nullptr) {
+            continue;
+        }
+        const auto icon =
+            font->line_height >= 40 ? theme->large_icon_font()->font() : theme->icon_font()->font();
+        lv_point_t volume_icon, wifi_icon;
+        lv_text_get_size(&volume_icon, MATERIAL_SYMBOLS_VOLUME_UP, icon, 0, 0, LV_COORD_MAX,
+                         LV_TEXT_FLAG_NONE);
+        lv_text_get_size(&wifi_icon, MATERIAL_SYMBOLS_WIFI, icon, 0, 0, LV_COORD_MAX,
+                         LV_TEXT_FLAG_NONE);
+        const auto side = std::max<lv_coord_t>(72, volume_size.x + volume_icon.x + 4);
+        if (side + wifi_icon.x / 2 + 4 > 120) {
+            return false;
+        }
+    }
+#endif
 
     // LVGL styles keep raw lv_font_t pointers. Keep the previous font owners alive until the
     // current theme has rebound every style to the new font.
@@ -132,6 +188,9 @@ LvglDisplay::~LvglDisplay() {
     if (mute_label_ != nullptr) {
         lv_obj_del(mute_label_);
     }
+    if (volume_label_ != nullptr) {
+        lv_obj_del(volume_label_);
+    }
     if (battery_label_ != nullptr) {
         lv_obj_del(battery_label_);
     }
@@ -157,7 +216,33 @@ void LvglDisplay::SetStatus(const char* status) {
         }
         return;
     }
+#if CONFIG_WAVESHARE_1_85C_HOME
+    const char* icon = nullptr;
+    auto is_status = [status](const char* text) {
+        return status != nullptr && strcmp(status, text) == 0;
+    };
+    if (is_status(Lang::Strings::STANDBY)) {
+        icon = "";
+    } else if (is_status(Lang::Strings::LISTENING)) {
+        icon = MATERIAL_SYMBOLS_MIC;
+    } else if (is_status(Lang::Strings::WAITING_RESPONSE)) {
+        icon = MATERIAL_SYMBOLS_PROGRESS_ACTIVITY;
+    } else if (is_status(Lang::Strings::SPEAKING)) {
+        icon = MATERIAL_SYMBOLS_VOLUME_UP;
+    } else if (is_status(Lang::Strings::LISTENING_PAUSED)) {
+        icon = MATERIAL_SYMBOLS_MIC_OFF;
+    }
+    home_status_is_icon_ = icon != nullptr;
+    auto theme = static_cast<LvglTheme*>(current_theme_);
+    const auto font =
+        home_status_is_icon_ ? theme->large_icon_font()->font() : theme->text_font()->font();
+    lv_obj_set_style_text_font(status_label_, font, 0);
+    lv_obj_set_height(status_label_, font->line_height);
+    lv_obj_center(status_label_);
+    lv_label_set_text(status_label_, home_status_is_icon_ ? icon : status);
+#else
     lv_label_set_text(status_label_, status);
+#endif
     lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
 
@@ -174,6 +259,11 @@ void LvglDisplay::ShowNotification(const char* notification, int duration_ms) {
                  notification);
     }
     DisplayLockGuard lock(this);
+#if CONFIG_WAVESHARE_1_85C_HOME
+    if (Application::GetInstance().IsListeningPaused()) {
+        return;
+    }
+#endif
     if (notification_label_ == nullptr) {
         if (setup_ui_called_) {
             ESP_LOGW(TAG,
@@ -191,10 +281,28 @@ void LvglDisplay::ShowNotification(const char* notification, int duration_ms) {
     ESP_ERROR_CHECK(esp_timer_start_once(notification_timer_, duration_ms * 1000));
 }
 
+void LvglDisplay::ApplyBatteryStatusStyle(LvglTheme* theme) {
+    if (!battery_status_supported_ || battery_label_ == nullptr || theme == nullptr) {
+        return;
+    }
+    auto text_font = theme->text_font()->font();
+    auto icon_font = text_font->line_height >= 40 ? theme->large_icon_font()->font()
+                                                  : theme->icon_font()->font();
+    lv_obj_set_style_text_font(battery_label_, battery_status_unknown_ ? text_font : icon_font, 0);
+    lv_obj_set_style_text_color(
+        battery_label_, battery_status_low_ ? lv_palette_main(LV_PALETTE_RED) : theme->text_color(),
+        0);
+}
+
 void LvglDisplay::UpdateStatusBar(bool update_all) {
     auto& app = Application::GetInstance();
     auto& board = Board::GetInstance();
     auto codec = board.GetAudioCodec();
+#if CONFIG_WAVESHARE_1_85C_HOME
+    const int output_volume = codec ? codec->GetOutputVolumeStatus().volume : 0;
+#else
+    const int output_volume = codec ? codec->output_volume() : 0;
+#endif
 
     // Update mute icon
     {
@@ -203,19 +311,48 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
             return;
         }
 
+        // HOME has a numeric text-font label, including a valid muted value of zero.
+#if CONFIG_WAVESHARE_1_85C_HOME
+        if (volume_label_ != nullptr) {
+            if (codec != nullptr) {
+                lv_label_set_text_fmt(volume_label_, "%d", output_volume);
+            } else {
+                lv_label_set_text(volume_label_, "?");
+            }
+        }
+        lv_label_set_text(mute_label_, output_volume == 0 ? MATERIAL_SYMBOLS_VOLUME_OFF
+                                                          : MATERIAL_SYMBOLS_VOLUME_UP);
+#else
         // Update icon if mute state changes
-        if (codec->output_volume() == 0 && !muted_) {
+        if (output_volume == 0 && !muted_) {
             muted_ = true;
             lv_label_set_text(mute_label_, MATERIAL_SYMBOLS_VOLUME_OFF);
-        } else if (codec->output_volume() > 0 && muted_) {
+        } else if (output_volume > 0 && muted_) {
             muted_ = false;
             lv_label_set_text(mute_label_, "");
         }
+#endif
     }
 
+#if CONFIG_WAVESHARE_1_85C_HOME
+    // HOME owns a separate clock row in every interaction and fault state.
+    time_t now = time(nullptr);
+    struct tm tm_now{};
+    char time_str[6] = "--:--";
+    if (localtime_r(&now, &tm_now) != nullptr && tm_now.tm_year >= 2025 - 1900) {
+        strftime(time_str, sizeof(time_str), "%H:%M", &tm_now);
+    }
+    {
+        DisplayLockGuard lock(this);
+        if (home_clock_label_ != nullptr) {
+            lv_label_set_text(home_clock_label_, time_str);
+        }
+    }
+#else
     // Update time — show HH:MM when idle; refresh immediately on state
     // transitions (update_all=true) and on every minute change thereafter.
-    if (app.GetDeviceState() == kDeviceStateIdle) {
+    if (app.GetDeviceState() == kDeviceStateIdle && !app.IsListeningPaused() &&
+        !app.HasConnectionAlert()) {
         time_t now = time(NULL);
         struct tm* tm_now = localtime(&now);
         if (tm_now->tm_year >= 2025 - 1900) {
@@ -233,13 +370,48 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
         // Reset so the clock re-appears immediately when idle resumes.
         last_displayed_clock_min_ = -1;
     }
+#endif
 
     esp_pm_lock_acquire(pm_lock_);
     // Update battery icon
     int battery_level;
     bool charging, discharging;
     const char* icon = nullptr;
-    if (board.GetBatteryLevel(battery_level, charging, discharging)) {
+    const auto battery_status = board.GetBatteryStatus();
+    {
+        DisplayLockGuard lock(this);
+        battery_status_supported_ = battery_status.supported;
+    }
+    if (battery_status.supported) {
+        // Coarse readings never enter the percentage/charging or legacy alert path.
+        icon = "?";
+        if (battery_status.state != BatteryState::Unknown) {
+            switch (battery_status.band) {
+                case BatteryBand::OneBar:
+                    icon = MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_1;
+                    break;
+                case BatteryBand::TwoBars:
+                    icon = MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_3;
+                    break;
+                case BatteryBand::ThreeBars:
+                    icon = MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_6;
+                    break;
+                default:
+                    break;
+            }
+        }
+        DisplayLockGuard lock(this);
+        battery_status_unknown_ = strcmp(icon, "?") == 0;
+        battery_status_low_ = !battery_status_unknown_ && battery_status.state == BatteryState::Low;
+        if (battery_label_ != nullptr) {
+            battery_icon_ = icon;
+            lv_label_set_text(battery_label_, icon);
+            ApplyBatteryStatusStyle(static_cast<LvglTheme*>(current_theme_));
+        }
+        if (low_battery_popup_ != nullptr) {
+            lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else if (board.GetBatteryLevel(battery_level, charging, discharging)) {
         if (charging) {
             icon = MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_BOLT;
         } else {
@@ -283,6 +455,15 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
         }
     }
 
+    // HOME is Wi-Fi only, so refresh in every interaction state on every tick.
+#if CONFIG_WAVESHARE_1_85C_HOME
+    icon = board.GetNetworkStateIcon();
+    if (network_label_ != nullptr && icon != nullptr && network_icon_ != icon) {
+        DisplayLockGuard lock(this);
+        network_icon_ = icon;
+        lv_label_set_text(network_label_, network_icon_);
+    }
+#else
     // Update network icon every 10 seconds
     static int seconds_counter = 0;
     if (update_all || seconds_counter++ % 10 == 0) {
@@ -302,6 +483,7 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
             }
         }
     }
+#endif
 
     esp_pm_lock_release(pm_lock_);
 }

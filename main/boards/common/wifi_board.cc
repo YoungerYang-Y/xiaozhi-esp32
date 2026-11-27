@@ -303,14 +303,35 @@ std::string WifiBoard::GetDeviceStatusJson() {
     // Audio speaker
     auto audio_speaker = cJSON_CreateObject();
     if (auto codec = board.GetAudioCodec()) {
+#if CONFIG_WAVESHARE_1_85C_HOME
+        const auto status = codec->GetOutputVolumeStatus();
+        cJSON_AddNumberToObject(audio_speaker, "volume", status.volume);
+        cJSON_AddBoolToObject(audio_speaker, "persisted", status.persisted);
+        cJSON_AddBoolToObject(audio_speaker, "applied", status.applied);
+        cJSON_AddBoolToObject(audio_speaker, "setting_error", status.error != ESP_OK);
+#else
         cJSON_AddNumberToObject(audio_speaker, "volume", codec->output_volume());
+#endif
     }
     cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
 
     // Screen
     auto screen = cJSON_CreateObject();
     if (auto backlight = board.GetBacklight()) {
+#if CONFIG_WAVESHARE_1_85C_HOME
+        const auto status = backlight->GetStatus();
+        cJSON_AddNumberToObject(screen, "brightness", status.brightness);
+        cJSON_AddBoolToObject(screen, "display_off", status.display_off);
+        cJSON_AddBoolToObject(screen, "persisted", status.persisted);
+        if (status.applied_brightness >= 0) {
+            cJSON_AddNumberToObject(screen, "applied_brightness", status.applied_brightness);
+        } else {
+            cJSON_AddNullToObject(screen, "applied_brightness");
+        }
+        cJSON_AddBoolToObject(screen, "setting_error", status.error != ESP_OK);
+#else
         cJSON_AddNumberToObject(screen, "brightness", backlight->brightness());
+#endif
     }
     if (auto display = board.GetDisplay(); display && display->height() > 64) {
         if (auto theme = display->GetTheme()) {
@@ -320,6 +341,17 @@ std::string WifiBoard::GetDeviceStatusJson() {
     cJSON_AddItemToObject(root, "screen", screen);
 
     // Battery
+#if CONFIG_WAVESHARE_1_85C_HOME
+    const auto battery_status = board.GetBatteryStatus();
+    auto battery = cJSON_CreateObject();
+    cJSON_AddStringToObject(battery, "state", BatteryStateName(battery_status.state));
+    if (battery_status.state != BatteryState::Unknown) {
+        if (const char* band = BatteryBandName(battery_status.band)) {
+            cJSON_AddStringToObject(battery, "band", band);
+        }
+    }
+    cJSON_AddItemToObject(root, "battery", battery);
+#else
     int level = 0;
     bool charging = false, discharging = false;
     if (board.GetBatteryLevel(level, charging, discharging)) {
@@ -328,6 +360,7 @@ std::string WifiBoard::GetDeviceStatusJson() {
         cJSON_AddBoolToObject(battery, "charging", charging);
         cJSON_AddItemToObject(root, "battery", battery);
     }
+#endif
 
     // Network
     auto& wifi = WifiManager::GetInstance();
@@ -336,6 +369,18 @@ std::string WifiBoard::GetDeviceStatusJson() {
     cJSON_AddStringToObject(network, "ssid", wifi.GetSsid().c_str());
     int rssi = wifi.GetRssi();
     const char* signal = rssi >= -60 ? "strong" : (rssi >= -70 ? "medium" : "weak");
+#if CONFIG_WAVESHARE_1_85C_HOME
+    const bool connected = wifi.IsConnected();
+    cJSON_AddBoolToObject(network, "connected", connected);
+#if CONFIG_WAVESHARE_1_85C_HOME_NETWORK_ALERTS
+    cJSON_AddStringToObject(
+        network, "service_state",
+        connected ? Application::GetInstance().GetServiceStateName() : "unknown");
+#endif
+    if (!connected) {
+        signal = "unknown";
+    }
+#endif
     cJSON_AddStringToObject(network, "signal", signal);
     cJSON_AddItemToObject(root, "network", network);
 
