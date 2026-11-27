@@ -7,7 +7,6 @@
 #include <esp_codec_dev_defaults.h>
 #include <mutex>
 
-
 class BoxAudioCodec : public AudioCodec {
 private:
     const audio_codec_data_if_t* data_if_ = nullptr;
@@ -19,12 +18,16 @@ private:
 
     esp_codec_dev_handle_t output_dev_ = nullptr;
     esp_codec_dev_handle_t input_dev_ = nullptr;
-    std::mutex data_if_mutex_;
+    mutable std::mutex data_if_mutex_;
+    OutputVolumeStatus output_volume_status_{70, false, false, ESP_OK};
+    bool output_needs_close_ = false;
     int reference_gain_channel_ = -1;
     float reference_gain_ = 0.0f;
 
     void CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout,
                               gpio_num_t din);
+    esp_err_t ApplyOutputVolumeChecked(int volume);
+    esp_err_t CloseOutputChecked();
 
     virtual int Read(int16_t* dest, int samples) override;
     virtual int Write(const int16_t* data, int samples) override;
@@ -37,9 +40,14 @@ public:
                   float reference_gain = 0.0f, float pa_voltage = 5.0f);
     virtual ~BoxAudioCodec();
 
+    virtual void Start() override;
     virtual void SetOutputVolume(int volume) override;
+    virtual OutputVolumeStatus SetOutputVolumeChecked(int volume) override;
+    virtual OutputVolumeStatus GetOutputVolumeStatus() const override;
     virtual void EnableInput(bool enable) override;
     virtual void EnableOutput(bool enable) override;
+    virtual bool SupportsCheckedOutput() const override;
+    virtual bool OutputDataChecked(std::vector<int16_t>& data) override;
 };
 
-#endif // _BOX_AUDIO_CODEC_H
+#endif  // _BOX_AUDIO_CODEC_H

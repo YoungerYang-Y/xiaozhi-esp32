@@ -2,21 +2,19 @@
 #include "board.h"
 #include "settings.h"
 
+#include <driver/i2s_common.h>
 #include <esp_log.h>
 #include <cstring>
-#include <driver/i2s_common.h>
 
 #define TAG "AudioCodec"
 
-AudioCodec::AudioCodec() {
-}
+AudioCodec::AudioCodec() {}
 
-AudioCodec::~AudioCodec() {
-}
+AudioCodec::~AudioCodec() {}
 
-void AudioCodec::OutputData(std::vector<int16_t>& data) {
-    Write(data.data(), data.size());
-}
+void AudioCodec::OutputData(std::vector<int16_t>& data) { Write(data.data(), data.size()); }
+
+bool AudioCodec::OutputDataChecked(std::vector<int16_t>& /*data*/) { return false; }
 
 bool AudioCodec::InputData(std::vector<int16_t>& data) {
     int samples = Read(data.data(), data.size());
@@ -29,10 +27,18 @@ bool AudioCodec::InputData(std::vector<int16_t>& data) {
 void AudioCodec::Start() {
     Settings settings("audio", false);
     output_volume_ = settings.GetInt("output_volume", output_volume_);
-    if (output_volume_ <= 0) {
-        ESP_LOGW(TAG, "Output volume value (%d) is too small, setting to default (10)", output_volume_);
+#if CONFIG_WAVESHARE_1_85C_HOME
+    if (output_volume_ < 0 || output_volume_ > 100) {
+        ESP_LOGW(TAG, "Invalid output volume (%d), setting to default (10)", output_volume_);
         output_volume_ = 10;
     }
+#else
+    if (output_volume_ <= 0) {
+        ESP_LOGW(TAG, "Output volume value (%d) is too small, setting to default (10)",
+                 output_volume_);
+        output_volume_ = 10;
+    }
+#endif
 
     ESP_LOGI(TAG, "Audio codec started");
 }
@@ -40,9 +46,17 @@ void AudioCodec::Start() {
 void AudioCodec::SetOutputVolume(int volume) {
     output_volume_ = volume;
     ESP_LOGI(TAG, "Set output volume to %d", output_volume_);
-    
+
     Settings settings("audio", true);
     settings.SetInt("output_volume", output_volume_);
+}
+
+OutputVolumeStatus AudioCodec::SetOutputVolumeChecked(int /*volume*/) {
+    return GetOutputVolumeStatus();
+}
+
+OutputVolumeStatus AudioCodec::GetOutputVolumeStatus() const {
+    return {output_volume_, false, false, ESP_ERR_NOT_SUPPORTED};
 }
 
 void AudioCodec::SetInputGain(float gain) {

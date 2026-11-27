@@ -1,14 +1,15 @@
 #ifndef _AUDIO_CODEC_H
 #define _AUDIO_CODEC_H
 
+#include <driver/i2s_std.h>
+#include <esp_err.h>
+#include <esp_idf_version.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
-#include <driver/i2s_std.h>
-#include <esp_idf_version.h>
 
-#include <vector>
-#include <string>
 #include <functional>
+#include <string>
+#include <vector>
 
 #include "board.h"
 
@@ -24,17 +25,31 @@
 #define XIAOZHI_I2S_PORT(port) static_cast<i2s_port_t>(port)
 #endif
 
+struct OutputVolumeStatus {
+    // The accepted software setting; both flags describe this value.
+    int volume;
+    bool persisted;
+    // False while output is disabled or hardware application is uncertain.
+    bool applied;
+    esp_err_t error;
+};
+
 class AudioCodec {
 public:
     AudioCodec();
     virtual ~AudioCodec();
-    
+
     virtual void SetOutputVolume(int volume);
+    virtual OutputVolumeStatus SetOutputVolumeChecked(int volume);
+    virtual OutputVolumeStatus GetOutputVolumeStatus() const;
     virtual void SetInputGain(float gain);
     virtual void EnableInput(bool enable);
     virtual void EnableOutput(bool enable);
 
     virtual void OutputData(std::vector<int16_t>& data);
+    // Optional receipt for local prompts. Legacy OutputData/Write retain their contract.
+    virtual bool SupportsCheckedOutput() const { return false; }
+    virtual bool OutputDataChecked(std::vector<int16_t>& data);
     virtual bool InputData(std::vector<int16_t>& data);
     virtual void Start();
 
@@ -68,4 +83,4 @@ protected:
     virtual int Write(const int16_t* data, int samples) = 0;
 };
 
-#endif // _AUDIO_CODEC_H
+#endif  // _AUDIO_CODEC_H

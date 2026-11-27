@@ -6,7 +6,7 @@
 #define TAG "Settings"
 
 Settings::Settings(const std::string& ns, bool read_write) : ns_(ns), read_write_(read_write) {
-    nvs_open(ns.c_str(), read_write_ ? NVS_READWRITE : NVS_READONLY, &nvs_handle_);
+    open_error_ = nvs_open(ns.c_str(), read_write_ ? NVS_READWRITE : NVS_READONLY, &nvs_handle_);
 }
 
 Settings::~Settings() {
@@ -65,6 +65,41 @@ void Settings::SetInt(const std::string& key, int32_t value) {
     } else {
         ESP_LOGW(TAG, "Namespace %s is not open for writing", ns_.c_str());
     }
+}
+
+esp_err_t Settings::TryGetInt(const std::string& key, int32_t& value) const {
+    if (open_error_ != ESP_OK) {
+        return open_error_;
+    }
+    int32_t stored_value;
+    auto err = nvs_get_i32(nvs_handle_, key.c_str(), &stored_value);
+    if (err == ESP_OK) {
+        value = stored_value;
+    }
+    return err;
+}
+
+esp_err_t Settings::TrySetIntAndCommit(const std::string& key, int32_t value) {
+    if (!read_write_) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (open_error_ != ESP_OK) {
+        return open_error_;
+    }
+
+    // Isolate checked writes from the legacy destructor commit. In particular, a failed
+    // commit must not be retried later by destruction or a subsequent checked write.
+    nvs_handle_t handle = 0;
+    auto err = nvs_open(ns_.c_str(), NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_i32(handle, key.c_str(), value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
 }
 
 bool Settings::GetBool(const std::string& key, bool default_value) {
