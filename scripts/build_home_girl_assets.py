@@ -14,6 +14,10 @@ import build_default_assets as pack
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LOCAL_ACTIONS = {"screen_on", "screen_off", "volume_up", "volume_down", "brightness_up",
+                 "brightness_down", "device_status", "cancel"}
+
+
 PROFILE = ROOT / "main/boards/waveshare/esp32-s3-touch-lcd-1.85c/assets/home-girl/profile.json"
 
 
@@ -60,16 +64,32 @@ def compile_bundle(base_assets, profile, source_dir, model_data, max_size=0x8000
     if index["text_font"] not in files:
         raise ValueError("The base text font is missing")
     size = profile["image_size"]
-    if not isinstance(size, int) or not 1 <= size <= 160:
+    if type(size) is not int or not 1 <= size <= 160:
         raise ValueError("HOME portrait size must be between 1 and 160 pixels")
     wake = profile["wake_word"]
-    if (wake.get("language") != "cn" or not 0 < wake.get("threshold", 0) < 1
-            or not 0 < wake.get("duration", 0) <= 5000 or not wake.get("commands")):
+    if (not isinstance(wake, dict) or wake.get("language") != "cn"
+            or type(wake.get("threshold")) not in (int, float)
+            or not 0 < wake["threshold"] < 1 or type(wake.get("duration")) is not int
+            or not 0 < wake["duration"] <= 5000 or not isinstance(wake.get("commands"), list)
+            or not wake["commands"]):
         raise ValueError("Invalid HOME wake-word configuration")
+    seen_actions, seen_text, seen_phrases = set(), set(), set()
     for command in wake["commands"]:
-        if (command.get("action") != "wake" or not command.get("text")
-                or not command.get("command")):
-            raise ValueError("Invalid HOME wake phrase")
+        if not isinstance(command, dict):
+            raise ValueError("Invalid HOME command action or phrase")
+        action, text, phrase = (command.get(key) for key in ("action", "text", "command"))
+        if (not isinstance(action, str) or action not in LOCAL_ACTIONS | {"wake"}
+                or not isinstance(text, str)
+                or not text.strip() or not isinstance(phrase, str) or not phrase.strip()):
+            raise ValueError("Invalid HOME command action or phrase")
+        normalized_phrase = " ".join(phrase.split()).lower()
+        if action in seen_actions or text.strip() in seen_text or normalized_phrase in seen_phrases:
+            raise ValueError("Duplicate HOME action, text or phrase")
+        seen_actions.add(action)
+        seen_text.add(text.strip())
+        seen_phrases.add(normalized_phrase)
+    if "wake" not in seen_actions:
+        raise ValueError("A separate wake action is required")
     if not model_data:
         raise ValueError("The packed MultiNet models are empty")
     for entry in index.get("emoji_collection", []):

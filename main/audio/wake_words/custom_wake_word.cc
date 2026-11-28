@@ -14,6 +14,7 @@
 CustomWakeWord::CustomWakeWord() = default;
 
 CustomWakeWord::~CustomWakeWord() {
+    Stop();
     if (multinet_model_data_ != nullptr && multinet_ != nullptr) {
         multinet_->destroy(multinet_model_data_);
         multinet_model_data_ = nullptr;
@@ -112,14 +113,30 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
     }
 
     multinet_ = esp_mn_handle_from_name(mn_name_);
+    if (multinet_ == nullptr) {
+        return false;
+    }
     multinet_model_data_ = multinet_->create(mn_name_, duration_);
+    if (multinet_model_data_ == nullptr) {
+        return false;
+    }
     multinet_->set_det_threshold(multinet_model_data_, threshold_);
     input_buffer_.reserve(multinet_->get_samp_chunksize(multinet_model_data_));
     esp_mn_commands_clear();
     for (int i = 0; i < commands_.size(); i++) {
-        esp_mn_commands_add(i + 1, commands_[i].command.c_str());
+        if (esp_mn_commands_add(i + 1, commands_[i].command.c_str()) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register MultiNet command %d", i + 1);
+            multinet_->destroy(multinet_model_data_);
+            multinet_model_data_ = nullptr;
+            return false;
+        }
     }
-    esp_mn_commands_update();
+    if (esp_mn_commands_update() != nullptr) {
+        ESP_LOGE(TAG, "MultiNet rejected one or more command phrases");
+        multinet_->destroy(multinet_model_data_);
+        multinet_model_data_ = nullptr;
+        return false;
+    }
 
     multinet_->print_active_speech_commands(multinet_model_data_);
 #if CONFIG_SEND_WAKE_WORD_DATA
@@ -148,8 +165,47 @@ std::vector<std::string> CustomWakeWord::GetWakeWords() const {
     return words;
 }
 
+bool CustomWakeWord::IsLocalAction(const std::string& action) {
+    return action == "screen_on" || action == "screen_off" || action == "volume_up" ||
+           action == "volume_down" || action == "brightness_up" || action == "brightness_down" ||
+           action == "device_status" || action == "cancel";
+}
+
+bool CustomWakeWord::HasLocalCommands() const {
+    if (multinet_model_data_ == nullptr) {
+        return false;
+    }
+    for (const auto& command : commands_) {
+        if (IsLocalAction(command.action)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CustomWakeWord::StartLocalCommands(uint64_t generation) {
+    if (generation == 0 || !HasLocalCommands()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(input_buffer_mutex_);
+    input_buffer_.clear();
+    multinet_->clean(multinet_model_data_);
+    local_generation_ = generation;
+    running_ = true;
+    return true;
+}
+
+void CustomWakeWord::OnLocalCommand(std::function<void(const std::string&, uint64_t)> callback) {
+    local_command_callback_ = std::move(callback);
+}
+
 void CustomWakeWord::Start() {
     std::lock_guard<std::mutex> lock(input_buffer_mutex_);
+    input_buffer_.clear();
+    if (multinet_model_data_ != nullptr) {
+        multinet_->clean(multinet_model_data_);
+    }
+    local_generation_ = 0;
     running_ = true;
 }
 
@@ -158,6 +214,7 @@ void CustomWakeWord::Stop() {
 
     std::lock_guard<std::mutex> lock(input_buffer_mutex_);
     input_buffer_.clear();
+    local_generation_ = 0;
 }
 
 void CustomWakeWord::ResetCapture() {
@@ -202,22 +259,32 @@ void CustomWakeWord::FeedSamples(const int16_t* data, size_t samples, bool mono)
     int chunksize = multinet_->get_samp_chunksize(multinet_model_data_);
     while (input_buffer_.size() >= chunksize) {
 #if CONFIG_SEND_WAKE_WORD_DATA
-        wake_word_encoder_.Store(input_buffer_.data(), chunksize);
+        if (local_generation_ == 0) {
+            wake_word_encoder_.Store(input_buffer_.data(), chunksize);
+        }
 #endif
 
         esp_mn_state_t mn_state = multinet_->detect(multinet_model_data_, input_buffer_.data());
 
         if (mn_state == ESP_MN_STATE_DETECTED) {
             esp_mn_results_t* mn_result = multinet_->get_results(multinet_model_data_);
-            for (int i = 0; i < mn_result->num && running_; i++) {
-                ESP_LOGI(TAG, "Custom wake word detected: command_id=%d, string=%s, prob=%f",
-                         mn_result->command_id[i], mn_result->string, mn_result->prob[i]);
-                auto& command = commands_[mn_result->command_id[i] - 1];
-                if (command.action == "wake") {
+            for (int i = 0; mn_result != nullptr && i < mn_result->num && running_; i++) {
+                const int id = mn_result->command_id[i];
+                if (id <= 0 || id > static_cast<int>(commands_.size())) {
+                    continue;
+                }
+                const auto& command = commands_[id - 1];
+                if (local_generation_ != 0 && IsLocalAction(command.action)) {
+                    const auto generation = local_generation_;
+                    running_ = false;
+                    input_buffer_.clear();
+                    if (local_command_callback_) {
+                        local_command_callback_(command.action, generation);
+                    }
+                } else if (local_generation_ == 0 && command.action == "wake") {
                     last_detected_wake_word_ = command.text;
                     running_ = false;
                     input_buffer_.clear();
-
                     if (wake_word_detected_callback_) {
                         wake_word_detected_callback_(last_detected_wake_word_);
                     }

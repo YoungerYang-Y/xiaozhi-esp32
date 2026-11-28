@@ -2,6 +2,7 @@
 #define AFE_AUDIO_ENGINE_H
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,10 @@ public:
     void EnableDeviceAec(bool enable) override;
     void ResetCapture() override;
 
+    bool HasLocalCommands() const override;
+    bool StartLocalCommands(uint64_t generation) override;
+    void StopLocalCommands() override;
+    void OnLocalCommand(std::function<void(const std::string&, uint64_t)> callback) override;
     bool HasWakeWord() const override;
     bool IsWakeWordDetectionEnabled() const override;
     bool IsVoiceProcessingEnabled() const override;
@@ -56,6 +61,12 @@ private:
     static constexpr EventBits_t kWakeWordEnabled = 1 << 0;
     static constexpr EventBits_t kVoiceProcessingEnabled = 1 << 1;
     static constexpr EventBits_t kAfeActive = 1 << 2;
+    static constexpr EventBits_t kLocalCommandsEnabled = 1 << 3;
+    static constexpr EventBits_t kStopRequested = 1 << 4;
+    std::mutex task_mutex_;
+    std::condition_variable task_cv_;
+    bool task_stopped_ = false;
+    std::atomic<bool> stopping_{false};
     static constexpr size_t kProcessingTaskStackSize = 4096;
 
     AudioCodec* codec_ = nullptr;
@@ -92,6 +103,7 @@ private:
     std::mutex callback_mutex_;
 
     std::function<void(const std::string&)> wake_word_detected_callback_;
+    std::function<void(const std::string&, uint64_t)> local_command_callback_;
     std::function<void(std::vector<int16_t>&&)> output_callback_;
     std::function<void(bool)> vad_state_change_callback_;
 

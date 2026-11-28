@@ -493,6 +493,21 @@ class AudioCapturePauseTests(unittest.TestCase):
             }
         '''
 
+    def test_home_capture_never_publishes_raw_audio_to_debugger(self):
+        program = self.debugger_program().split("int main(int, char** argv)", 1)[0]
+        self.compile_and_run("#define CONFIG_HOME_OFFLINE 1\n" + program + r'''
+            int main(int, char**) {
+                AudioService audio;
+                AudioCodec codec;
+                audio.codec_ = &codec;
+                audio.service_stopped_ = false;
+                read_gate.Release();
+                std::vector<int16_t> data;
+                assert(audio.ReadAudioData(data, 16000, 2));
+                assert(debugger_publications == 0 && !audio.audio_debugger_);
+            }
+        ''', "home-debug")
+
     def test_debugger_paused_input_does_not_read_or_publish(self):
         self.compile_and_run(self.debugger_program(), "debug_paused")
 
@@ -542,7 +557,10 @@ class AudioCapturePauseTests(unittest.TestCase):
         ''', "wake")
 
     def afe_program(self):
-        names = ["AfeAudioEngine::AfeAudioEngine()", "AfeAudioEngine::Feed(",
+        names = ["AfeAudioEngine::AfeAudioEngine()", "AfeAudioEngine::~AfeAudioEngine()",
+                 "AfeAudioEngine::Feed(",
+                 "AfeAudioEngine::HasLocalCommands()", "AfeAudioEngine::StartLocalCommands(",
+                 "AfeAudioEngine::StopLocalCommands()", "AfeAudioEngine::OnLocalCommand(",
                  "AfeAudioEngine::EnableWakeWordDetection(", "AfeAudioEngine::EnableVoiceProcessing(",
                  "AfeAudioEngine::ResetCapture()", "AfeAudioEngine::EnableDeviceAec(",
                  "AfeAudioEngine::HasWakeWord()", "AfeAudioEngine::GetWakeWords()",
@@ -571,16 +589,25 @@ class AudioCapturePauseTests(unittest.TestCase):
                     };
                     int16_t samples[] = {1, 1};
                     afe_fetch_result_t result{samples};
+                    bool timed_fetch = false;
+                    std::atomic<int> destroyed{0};
+                    void esp_srmodel_deinit(srmodel_list_t*) {}
                     struct esp_afe_sr_iface_t {
                         int (*get_feed_chunksize)(esp_afe_sr_data_t*) =
                             [](esp_afe_sr_data_t*) { return 2; };
                         void (*feed)(esp_afe_sr_data_t*, int16_t*) = [](esp_afe_sr_data_t*, int16_t*) {};
                         afe_fetch_result_t* (*fetch_with_delay)(esp_afe_sr_data_t*, uint32_t) =
-                            [](esp_afe_sr_data_t*, uint32_t) {
+                            [](esp_afe_sr_data_t*, uint32_t ticks) {
+                                if (timed_fetch) {
+                                    assert(ticks <= 50);
+                                    std::this_thread::sleep_for(5ms);
+                                    return &result;
+                                }
                                 fetch_gate.Wait();
                                 if (stop_afe) throw StopTask{};
                                 return &result;
                             };
+                        void (*destroy)(esp_afe_sr_data_t*) = [](esp_afe_sr_data_t*) { ++destroyed; };
                         void (*reset_buffer)(esp_afe_sr_data_t*) = [](esp_afe_sr_data_t*) {};
                         void (*enable_wakenet)(esp_afe_sr_data_t*) = [](esp_afe_sr_data_t*) {};
                         void (*disable_wakenet)(esp_afe_sr_data_t*) = [](esp_afe_sr_data_t*) {};
@@ -589,7 +616,10 @@ class AudioCapturePauseTests(unittest.TestCase):
                     };
                     struct CustomWakeWord {
                         void Start() {} void Stop() {} void ResetCapture() {}
-                        void FeedMono(const int16_t*, size_t) {}
+                        bool HasLocalCommands() const { return true; }
+                        bool StartLocalCommands(uint64_t generation) { return generation != 0; }
+                        std::atomic<int> feeds{0};
+                        void FeedMono(const int16_t*, size_t) { ++feeds; }
                         std::vector<std::string> GetWakeWords() const { return {}; }
                         void EncodeWakeWordData() {}
                         bool GetWakeWordOpus(std::vector<uint8_t>&) { return false; }
@@ -599,7 +629,6 @@ class AudioCapturePauseTests(unittest.TestCase):
                     "private:", "public:")
                 + "\n".join(method("main/audio/engines/afe_audio_engine.cc", name) for name in names)
                 + r'''
-                    AfeAudioEngine::~AfeAudioEngine() = default;
                     bool AfeAudioEngine::Initialize(AudioCodec*, int, srmodel_list_t*) { return true; }
                     int main(int, char** argv) {
                         AfeAudioEngine engine;
@@ -612,6 +641,41 @@ class AudioCapturePauseTests(unittest.TestCase):
                         engine.frame_samples_ = 2;
                         std::atomic<int> outputs{0};
                         std::string scenario = argv[1];
+                        if (scenario == "destructor-active" || scenario == "destructor-idle") {
+                            auto owned = std::make_unique<AfeAudioEngine>();
+                            owned->codec_ = &codec; owned->afe_data_ = &data; owned->afe_iface_ = &iface;
+                            if (scenario == "destructor-active") owned->EnableVoiceProcessing(true);
+                            timed_fetch = true;
+                            owned->processing_task_ = xTaskCreateStatic([](void* arg) {
+                                static_cast<AfeAudioEngine*>(arg)->ProcessingTask();
+                                vTaskSuspend(nullptr);
+                            }, "host_afe", 4096, owned.get(), 1, nullptr, nullptr);
+                            auto shutdown = std::async(std::launch::async, [&] { owned.reset(); });
+                            assert(shutdown.wait_for(2s) == std::future_status::ready);
+                            shutdown.get();
+                            assert(destroyed == 1);
+                            return 0;
+                        }
+                        if (scenario == "local") {
+                            assert(!engine.HasLocalCommands());
+                            engine.custom_wake_word_ = std::make_unique<CustomWakeWord>();
+                            engine.wake_detector_ = AfeAudioEngine::WakeDetector::kMultiNet;
+                            engine.OnOutput([&](std::vector<int16_t>&&) { ++outputs; });
+                            engine.EnableVoiceProcessing(true);
+                            assert(engine.StartLocalCommands(99));
+                            assert(!engine.IsVoiceProcessingEnabled() && !engine.IsWakeWordDetectionEnabled());
+                            std::thread processing([&] {
+                                try { engine.ProcessingTask(); } catch (StopTask&) {}
+                            });
+                            fetch_gate.Until(1); fetch_gate.Release(); fetch_gate.Until(2);
+                            assert(engine.custom_wake_word_->feeds == 1 && outputs == 0);
+                            engine.StopLocalCommands();
+                            assert(!(xEventGroupGetBits(engine.event_group_) & engine.kLocalCommandsEnabled));
+                            stop_afe = true; xEventGroupSetBits(engine.event_group_, engine.kStopRequested);
+                            fetch_gate.Release(10); processing.join();
+                            assert(outputs == 0);
+                            return 0;
+                        }
                         const bool wake = scenario == "wake_callback";
                         auto callback = [&] {
                             callback_gate.Wait();
@@ -660,6 +724,13 @@ class AudioCapturePauseTests(unittest.TestCase):
                     }
                 ''')
 
+    def test_afe_destructor_joins_active_or_idle_processing_before_free(self):
+        for scenario in ("destructor-active", "destructor-idle"):
+            self.compile_and_run(self.afe_program(), scenario)
+
+    def test_afe_local_commands_cannot_emit_pcm_or_keep_wake_enabled(self):
+        self.compile_and_run(self.afe_program(), "local")
+
     def test_afe_fetch_from_old_generation_cannot_reach_new_session(self):
         self.compile_and_run(self.afe_program(), "fetch")
 
@@ -675,7 +746,7 @@ class AudioCapturePauseTests(unittest.TestCase):
                  "CustomWakeWord::FeedMono(", "CustomWakeWord::FeedSamples(",
                  "CustomWakeWord::OnWakeWordDetected(", "CustomWakeWord::GetFeedSize()",
                  "CustomWakeWord::EncodeWakeWordData()", "CustomWakeWord::GetWakeWordOpus(",
-                 "CustomWakeWord::GetWakeWords()"]
+                 "CustomWakeWord::GetWakeWords()", "CustomWakeWord::IsLocalAction("]
         self.compile_and_run(textwrap.dedent(PLATFORM)
                              + without_includes(source("main/audio/wake_word.h"))
                              + without_includes(source("main/audio/wake_words/wake_word_audio_cache.h")).replace(

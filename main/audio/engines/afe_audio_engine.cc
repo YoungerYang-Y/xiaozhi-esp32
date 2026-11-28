@@ -24,6 +24,15 @@ static constexpr bool kUseAfeForVoiceProcessing = false;
 AfeAudioEngine::AfeAudioEngine() { event_group_ = xEventGroupCreate(); }
 
 AfeAudioEngine::~AfeAudioEngine() {
+    ResetCapture();
+    if (processing_task_ != nullptr) {
+        std::unique_lock<std::mutex> lock(task_mutex_);
+        stopping_ = true;
+        xEventGroupSetBits(event_group_, kStopRequested);
+        task_cv_.wait(lock, [this] { return task_stopped_; });
+        lock.unlock();
+        vTaskDelete(processing_task_);
+    }
     custom_wake_word_.reset();
     if (afe_data_ != nullptr) {
         afe_iface_->destroy(afe_data_);
@@ -83,6 +92,13 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
             UpdateActiveState();
             if (wake_word_detected_callback_) {
                 wake_word_detected_callback_(wake_word);
+            }
+        });
+        custom_wake_word_->OnLocalCommand([this](const std::string& action, uint64_t generation) {
+            xEventGroupClearBits(event_group_, kLocalCommandsEnabled);
+            UpdateActiveState();
+            if (local_command_callback_) {
+                local_command_callback_(action, generation);
             }
         });
         if (!custom_wake_word_->Initialize(codec_, models_)) {
@@ -223,7 +239,7 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
         [](void* arg) {
             auto* engine = static_cast<AfeAudioEngine*>(arg);
             engine->ProcessingTask();
-            vTaskDelete(nullptr);
+            vTaskSuspend(nullptr);
         },
         "audio_afe", kProcessingTaskStackSize, this, 3, processing_task_stack_,
         processing_task_buffer_);
@@ -312,7 +328,8 @@ void AfeAudioEngine::EnableVoiceProcessing(bool enable) {
 
 void AfeAudioEngine::ResetCapture() {
     std::lock_guard<std::mutex> callback_lock(callback_mutex_);
-    xEventGroupClearBits(event_group_, kWakeWordEnabled | kVoiceProcessingEnabled | kAfeActive);
+    xEventGroupClearBits(event_group_, kWakeWordEnabled | kVoiceProcessingEnabled |
+                                           kLocalCommandsEnabled | kAfeActive);
     control_generation_.fetch_add(1);
     is_speaking_ = false;
     output_reset_pending_ = true;
@@ -326,6 +343,45 @@ void AfeAudioEngine::ResetCapture() {
     if (custom_wake_word_) {
         custom_wake_word_->ResetCapture();
     }
+}
+
+bool AfeAudioEngine::HasLocalCommands() const {
+    return custom_wake_word_ && custom_wake_word_->HasLocalCommands();
+}
+
+bool AfeAudioEngine::StartLocalCommands(uint64_t generation) {
+    std::lock_guard<std::mutex> callback_lock(callback_mutex_);
+    if (!HasLocalCommands() || generation == 0) {
+        return false;
+    }
+    // No wake callbacks or PCM output may escape the command-only phase.
+    control_generation_.fetch_add(1);
+    reset_pending_ = true;
+    xEventGroupClearBits(event_group_, kWakeWordEnabled | kVoiceProcessingEnabled);
+    if (!custom_wake_word_->StartLocalCommands(generation)) {
+        return false;
+    }
+    xEventGroupSetBits(event_group_, kLocalCommandsEnabled);
+    UpdateActiveState();
+    return true;
+}
+
+void AfeAudioEngine::StopLocalCommands() {
+    std::lock_guard<std::mutex> callback_lock(callback_mutex_);
+    if ((xEventGroupGetBits(event_group_) & kLocalCommandsEnabled) == 0) {
+        return;
+    }
+    control_generation_.fetch_add(1);
+    reset_pending_ = true;
+    xEventGroupClearBits(event_group_, kLocalCommandsEnabled);
+    if (custom_wake_word_) {
+        custom_wake_word_->Stop();
+    }
+    UpdateActiveState();
+}
+
+void AfeAudioEngine::OnLocalCommand(std::function<void(const std::string&, uint64_t)> callback) {
+    local_command_callback_ = std::move(callback);
 }
 
 void AfeAudioEngine::EnableDeviceAec(bool enable) {
@@ -371,7 +427,7 @@ void AfeAudioEngine::OnVadStateChange(std::function<void(bool speaking)> callbac
 void AfeAudioEngine::UpdateActiveState() {
     EventBits_t bits = xEventGroupGetBits(event_group_);
     const bool afe_active =
-        afe_data_ != nullptr && ((bits & kWakeWordEnabled) ||
+        afe_data_ != nullptr && ((bits & (kWakeWordEnabled | kLocalCommandsEnabled)) ||
                                  (kUseAfeForVoiceProcessing && (bits & kVoiceProcessingEnabled)));
     if (afe_active) {
         xEventGroupSetBits(event_group_, kAfeActive);
@@ -413,7 +469,7 @@ void AfeAudioEngine::ApplyAfeControls() {
         }
     }
     if (codec_->input_reference()) {
-        const bool enable_aec = (bits & kWakeWordEnabled) ||
+        const bool enable_aec = (bits & (kWakeWordEnabled | kLocalCommandsEnabled)) ||
                                 (device_aec_enabled_.load() && (bits & kVoiceProcessingEnabled));
         if (enable_aec) {
             afe_iface_->enable_aec(afe_data_);
@@ -435,8 +491,12 @@ void AfeAudioEngine::ApplyPendingReset() {
 }
 
 void AfeAudioEngine::ProcessingTask() {
-    while (true) {
-        xEventGroupWaitBits(event_group_, kAfeActive, pdFALSE, pdTRUE, portMAX_DELAY);
+    while (!stopping_.load()) {
+        xEventGroupWaitBits(event_group_, kAfeActive | kStopRequested, pdFALSE, pdFALSE,
+                            portMAX_DELAY);
+        if (stopping_.load()) {
+            break;
+        }
         uint32_t generation;
         {
             std::lock_guard<std::mutex> callback_lock(callback_mutex_);
@@ -453,7 +513,7 @@ void AfeAudioEngine::ProcessingTask() {
             }
             generation = control_generation_.load();
         }
-        auto* result = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
+        auto* result = afe_iface_->fetch_with_delay(afe_data_, pdMS_TO_TICKS(50));
         // Fence both the generation check and all callback submissions. Merely
         // checking the generation before a handler leaves a disable race.
         std::unique_lock<std::mutex> callback_lock(callback_mutex_);
@@ -473,13 +533,16 @@ void AfeAudioEngine::ProcessingTask() {
         }
 
         EventBits_t bits = xEventGroupGetBits(event_group_);
-        if (bits & kWakeWordEnabled) {
+        if (bits & (kWakeWordEnabled | kLocalCommandsEnabled)) {
             HandleWakeWordResult(result);
         }
         if (kUseAfeForVoiceProcessing && (bits & kVoiceProcessingEnabled)) {
             HandleVoiceResult(result);
         }
     }
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    task_stopped_ = true;
+    task_cv_.notify_all();
 }
 
 void AfeAudioEngine::HandleWakeWordResult(const afe_fetch_result_t* result) {

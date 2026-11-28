@@ -26,6 +26,12 @@ public:
     // finish, but must not publish audio or touch the next session's cache.
     virtual void ResetCapture() = 0;
 
+    // Optional offline command phase. Lite engines honestly report unsupported.
+    virtual bool HasLocalCommands() const { return false; }
+    virtual bool StartLocalCommands(uint64_t) { return false; }
+    virtual void StopLocalCommands() {}
+    virtual void OnLocalCommand(std::function<void(const std::string&, uint64_t)>) {}
+
     virtual bool HasWakeWord() const = 0;
     virtual bool IsWakeWordDetectionEnabled() const = 0;
     virtual bool IsVoiceProcessingEnabled() const = 0;

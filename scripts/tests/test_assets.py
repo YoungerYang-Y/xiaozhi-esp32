@@ -58,7 +58,10 @@ class AssetsTest(unittest.TestCase):
                 #include <memory>
                 #include <string>
                 #include <vector>
-                inline std::vector<uint8_t> partition_data;
+                inline std::vector<uint8_t> partition_data, response_data;
+                inline size_t response_length = 0, response_position = 0;
+                inline bool fail_transfer = false, model_live = false, mapped = false;
+                inline int model_deinits = 0, erases = 0;
                 inline bool lvgl_ready = false, gui_available = false, monochrome = false;
                 inline int model_loads = 0, model_sets = 0, font_creations = 0;
                 inline int image_creations = 0, ui_calls = 0, theme_refreshes = 0;
@@ -72,8 +75,7 @@ class AssetsTest(unittest.TestCase):
                 class AudioService {
                 public:
                     void SetModelsList(srmodel_list_t* models) {
-                        assert(models != nullptr);
-                        ++model_sets;
+                        if (models != nullptr) ++model_sets;
                     }
                 };
                 class Application {
@@ -89,12 +91,16 @@ class AssetsTest(unittest.TestCase):
                 #include "host_state.h"
                 struct srmodel_list_t {};
                 inline srmodel_list_t* srmodel_load(uint8_t* data) {
-                    assert(std::memcmp(data, "models", 6) == 0);
+                    assert(std::memcmp(data + 80, "models", 6) == 0);
+                    assert(!model_live && mapped);
+                    model_live = true;
                     ++model_loads;
                     static srmodel_list_t models;
                     return &models;
                 }
-                inline void esp_srmodel_deinit(srmodel_list_t*) {}
+                inline void esp_srmodel_deinit(srmodel_list_t*) {
+                    assert(model_live && mapped); model_live = false; ++model_deinits;
+                }
             ''',
             "esp_partition.h": r'''
                 #pragma once
@@ -117,17 +123,24 @@ class AssetsTest(unittest.TestCase):
                 inline int esp_partition_mmap(const esp_partition_t*, size_t, size_t, int,
                                                const void** data,
                                                esp_partition_mmap_handle_t* handle) {
+                    assert(!mapped); mapped = true;
                     *data = partition_data.data();
                     *handle = 1;
                     return ESP_OK;
                 }
-                inline void esp_partition_munmap(esp_partition_mmap_handle_t) {}
-                inline size_t esp_partition_get_main_flash_sector_size() { return 4096; }
-                inline int esp_partition_erase_range(const esp_partition_t*, size_t, size_t) {
-                    std::abort();
+                inline void esp_partition_munmap(esp_partition_mmap_handle_t) {
+                    assert(mapped && !model_live); mapped = false;
                 }
-                inline int esp_partition_write(const esp_partition_t*, size_t,
-                                                const void*, size_t) { std::abort(); }
+                inline size_t esp_partition_get_main_flash_sector_size() { return 4096; }
+                inline int esp_partition_erase_range(const esp_partition_t*, size_t offset, size_t size) {
+                    assert(!mapped && !model_live); ++erases;
+                    std::memset(partition_data.data() + offset, 0xff, size); return ESP_OK;
+                }
+                inline int esp_partition_write(const esp_partition_t*, size_t offset,
+                                                const void* data, size_t size) {
+                    assert(!mapped && !model_live);
+                    std::memcpy(partition_data.data() + offset, data, size); return ESP_OK;
+                }
             ''',
             "spi_flash_mmap.h": r'''
                 #pragma once
@@ -209,25 +222,32 @@ class AssetsTest(unittest.TestCase):
             "board.h": r'''
                 #pragma once
                 #include "display.h"
-                struct HttpError { std::string ToString() const { std::abort(); } };
+                struct HttpError { std::string ToString() const { return "test transfer failure"; } };
                 struct HttpResult {
-                    explicit operator bool() const { std::abort(); }
-                    int operator*() const { std::abort(); }
-                    HttpError error() const { std::abort(); }
+                    int value; bool valid = true;
+                    explicit operator bool() const { return valid; }
+                    int operator*() const { return value; }
+                    HttpError error() const { return {}; }
                 };
                 struct Http {
-                    HttpResult Open(const char*, const std::string&) { std::abort(); }
-                    HttpResult GetStatusCode() { std::abort(); }
-                    size_t GetBodyLength() { std::abort(); }
-                    HttpResult Read(void*, size_t) { std::abort(); }
+                    HttpResult Open(const char*, const std::string&) { response_position = 0; return {1}; }
+                    HttpResult GetStatusCode() { return {200}; }
+                    size_t GetBodyLength() { return response_length; }
+                    HttpResult Read(void* data, size_t capacity) {
+                        if (fail_transfer && response_position >= 32) return {-1, false};
+                        size_t n = std::min(capacity, response_data.size() - response_position);
+                        if (fail_transfer) n = std::min(n, size_t(32));
+                        std::memcpy(data, response_data.data() + response_position, n);
+                        response_position += n; return {static_cast<int>(n)};
+                    }
                 };
-                struct Network { std::unique_ptr<Http> CreateHttp(int) { std::abort(); } };
+                struct Network { std::unique_ptr<Http> CreateHttp(int) { return std::make_unique<Http>(); } };
                 class Board {
                 public:
                     Display* display = nullptr;
                     static Board& GetInstance() { static Board board; return board; }
                     Display* GetDisplay() { return display; }
-                    Network* GetNetwork() { std::abort(); }
+                    Network* GetNetwork() { static Network network; return &network; }
                 };
             ''',
         }
@@ -300,10 +320,37 @@ class AssetsTest(unittest.TestCase):
                 std::ifstream input(argv[2], std::ios::binary);
                 assert(input);
                 partition_data.assign(std::istreambuf_iterator<char>(input), {});
+                const size_t fixture_size = partition_data.size();
                 partition_data.resize(65536);
                 auto& assets = Assets::GetInstance();
+                if (mode == "invalid") {
+                    assert(!assets.partition_valid() && !assets.Apply());
+                    std::cout << "{}"; return 0;
+                }
                 assert(assets.partition_valid());
                 bool applied = assets.Apply(mode != "lcd-no-refresh");
+                if (mode == "reapply") {
+                    assert(assets.Apply());
+                    assert(model_loads == 1 && model_sets == 1);
+                }
+                if (mode.rfind("download-", 0) == 0) {
+                    assert(applied && model_loads == 1);
+                    response_data.assign(partition_data.begin(), partition_data.begin() + fixture_size);
+                    response_length = response_data.size();
+                    fail_transfer = mode == "download-partial";
+                    if (mode == "download-corrupt") response_data.back() ^= 0x10;
+                    if (mode == "download-overlong") response_length -= 5;
+                    bool downloaded = assets.Download("test", {});
+                    assert(downloaded == (mode == "download-success"));
+                    if (downloaded) {
+                        assert(assets.partition_valid() && assets.Apply());
+                        assert(model_loads == 2 && model_deinits == 1);
+                    } else {
+                        assert(!assets.partition_valid() || mode == "download-overlong");
+                        assert(!model_live);
+                    }
+                    assert(erases > 0 || mode == "download-overlong");
+                }
                 std::cout << "{\"applied\":" << applied
                           << ",\"model_loads\":" << model_loads
                           << ",\"model_sets\":" << model_sets
@@ -334,7 +381,7 @@ class AssetsTest(unittest.TestCase):
         if compilation.returncode:
             raise RuntimeError("Failed to compile Assets host test:\n" + compilation.stderr)
 
-    def apply(self, mode, index=None):
+    def apply(self, mode, index=None, mutate=None, model_data=None):
         if index is None:
             index = {
                 "version": 1, "srmodels": "models.bin", "text_font": "font.bin",
@@ -347,7 +394,9 @@ class AssetsTest(unittest.TestCase):
                 "hide_subtitle": True,
             }
         index_data = index if isinstance(index, bytes) else json.dumps(index).encode()
-        files = {"index.json": index_data, "models.bin": b"models", "font.bin": b"font",
+        if model_data is None:
+            model_data = struct.pack("<I32sI32sII", 1, b"mn7_cn", 1, b"weights", 80, 6) + b"models"
+        files = {"index.json": index_data, "models.bin": model_data, "font.bin": b"font",
                  "emoji.bin": b"image", "background.bin": b"image"}
         table, data = bytearray(), bytearray()
         for name, contents in files.items():
@@ -355,12 +404,42 @@ class AssetsTest(unittest.TestCase):
             data.extend(b"ZZ" + contents)
         payload = table + data
         fixture = Path(self.directory.name) / "assets.bin"
+        if mutate:
+            mutate(payload)
         fixture.write_bytes(struct.pack("<III", len(files), sum(payload) & 0xFFFF, len(payload))
                             + payload)
         result = subprocess.run([str(self.executable), mode, str(fixture)],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def test_download_releases_models_before_unmap_and_revalidates_replacement(self):
+        for mode in ("download-success", "download-partial", "download-corrupt", "download-overlong"):
+            with self.subTest(mode=mode):
+                self.apply(mode)
+
+    def test_rejects_checksummed_table_with_unsafe_names_or_offsets(self):
+        cases = [lambda p: p.__setitem__(0, 0),
+                 lambda p: p.__setitem__(slice(44, 76), p[0:32]),
+                 lambda p: struct.pack_into("<I", p, 36, 0xffffffff),
+                 lambda p: struct.pack_into("<I", p, 32, 0xffffffff),
+                 lambda p: p.__setitem__(5 * 44, 0)]
+        for mutate in cases:
+            self.assertEqual(self.apply("invalid", mutate=mutate), {})
+
+    def test_rejects_truncated_or_out_of_range_srmodel_directory(self):
+        for data in (b"models", struct.pack("<I", 0xffffffff),
+                     struct.pack("<I32sI32sII", 1, b"mn7_cn", 1, b"weights", 0xffffffff, 6)):
+            with self.subTest(data=data):
+                result = self.apply("headless", model_data=data)
+                self.assertEqual((result["applied"], result["model_loads"]), (0, 0))
+
+    def test_full_width_asset_names_remain_supported_and_bounded(self):
+        result = self.apply("headless", mutate=lambda p: p.__setitem__(slice(4 * 44, 4 * 44 + 32), b"x" * 32))
+        self.assertEqual(result["applied"], 1)
+
+    def test_reapply_keeps_live_speech_models(self):
+        self.assertEqual(self.apply("reapply")["model_loads"], 1)
 
     def test_unavailable_ui_preserves_speech_without_rendering_or_glyph_push(self):
         for mode in ("null", "headless", "headless-initialized", "gui-uninitialized"):

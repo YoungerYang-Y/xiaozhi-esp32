@@ -9,6 +9,7 @@
 #include <model_path.h>
 
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -28,6 +29,9 @@ public:
     void Feed(const std::vector<int16_t>& data);
     void FeedMono(const int16_t* data, size_t samples);
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback);
+    bool HasLocalCommands() const;
+    bool StartLocalCommands(uint64_t generation);
+    void OnLocalCommand(std::function<void(const std::string&, uint64_t)> callback);
     void Start();
     void Stop();
     void ResetCapture();
@@ -56,6 +60,8 @@ private:
     std::deque<Command> commands_;
 
     std::function<void(const std::string& wake_word)> wake_word_detected_callback_;
+    std::function<void(const std::string&, uint64_t)> local_command_callback_;
+    uint64_t local_generation_ = 0;  // input_buffer_mutex_; zero selects wake-only.
     AudioCodec* codec_ = nullptr;
     std::string last_detected_wake_word_;
     std::atomic<bool> running_ = false;
@@ -64,6 +70,7 @@ private:
 
     WakeWordAudioEncoder wake_word_encoder_;
 
+    static bool IsLocalAction(const std::string& action);
     void FeedSamples(const int16_t* data, size_t samples, bool mono);
     void ParseWakenetModelConfig();
 };

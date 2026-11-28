@@ -50,6 +50,27 @@ class HomeGirlAssetsTest(unittest.TestCase):
         output.write_bytes(result)
         return pack.read_assets_entries(output)
 
+    def test_full_home_profile_contains_fixed_actions_and_phrases(self):
+        profile = json.loads(builder.PROFILE.read_text())
+        commands = profile["wake_word"]["commands"]
+        self.assertEqual({c["action"]: c["text"] for c in commands}, {
+            "wake": "你好小妹妹", "screen_on": "打开屏幕", "screen_off": "关闭屏幕",
+            "volume_up": "音量大一点", "volume_down": "音量小一点",
+            "brightness_up": "屏幕亮一点", "brightness_down": "屏幕暗一点",
+            "device_status": "查看设备状态", "cancel": "取消操作"})
+
+    def test_accepts_fixed_actions_and_rejects_unknown_or_duplicate_commands(self):
+        command = {"command": "da kai ping mu", "text": "打开屏幕", "action": "screen_on"}
+        self.profile["wake_word"]["commands"].append(command)
+        self.compile()
+        for bad in ({**command, "action": "reboot"}, command,
+                    {**command, "command": "other", "action": "screen_off"}):
+            with self.subTest(bad=bad):
+                self.profile["wake_word"]["commands"].append(bad)
+                with self.assertRaisesRegex(ValueError, "action|Duplicate|duplicate"):
+                    self.compile()
+                self.profile["wake_word"]["commands"].pop()
+
     def test_replaces_phrase_and_models_without_losing_font_or_other_resources(self):
         files = self.compile()
         index = json.loads(files["index.json"][0])

@@ -5,7 +5,51 @@
     "duration": 3000,
     "threshold": 0.2,
     "commands": [
-      {"command": "ni hao xiao mei mei", "text": "你好小妹妹", "action": "wake"}
+      {
+        "command": "ni hao xiao mei mei",
+        "text": "你好小妹妹",
+        "action": "wake"
+      },
+      {
+        "command": "da kai ping mu",
+        "text": "打开屏幕",
+        "action": "screen_on"
+      },
+      {
+        "command": "guan bi ping mu",
+        "text": "关闭屏幕",
+        "action": "screen_off"
+      },
+      {
+        "command": "yin liang da yi dian",
+        "text": "音量大一点",
+        "action": "volume_up"
+      },
+      {
+        "command": "yin liang xiao yi dian",
+        "text": "音量小一点",
+        "action": "volume_down"
+      },
+      {
+        "command": "ping mu liang yi dian",
+        "text": "屏幕亮一点",
+        "action": "brightness_up"
+      },
+      {
+        "command": "ping mu an yi dian",
+        "text": "屏幕暗一点",
+        "action": "brightness_down"
+      },
+      {
+        "command": "cha kan she bei zhuang tai",
+        "text": "查看设备状态",
+        "action": "device_status"
+      },
+      {
+        "command": "qu xiao cao zuo",
+        "text": "取消操作",
+        "action": "cancel"
+      }
     ]
   },
   "emotions": {

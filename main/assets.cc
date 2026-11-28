@@ -19,6 +19,54 @@
 #define TAG "Assets"
 #define PARTITION_LABEL "assets"
 
+namespace {
+// ESP-SR 2.4.7's srmodel_load trusts every count/offset. Validate its binary
+// directory before passing mapped bytes to that parser (which has no length).
+bool ValidateSrmodels(const void* data, size_t size) {
+    constexpr size_t kNameSize = 32;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    size_t cursor = 0;
+    auto read_u32 = [&](uint32_t& value) {
+        if (cursor > size || size - cursor < 4) {
+            return false;
+        }
+        value = static_cast<uint32_t>(bytes[cursor]) |
+                (static_cast<uint32_t>(bytes[cursor + 1]) << 8) |
+                (static_cast<uint32_t>(bytes[cursor + 2]) << 16) |
+                (static_cast<uint32_t>(bytes[cursor + 3]) << 24);
+        cursor += 4;
+        return true;
+    };
+    uint32_t model_count = 0;
+    if (!read_u32(model_count) || model_count == 0 || model_count > (size - cursor) / 36) {
+        return false;
+    }
+    for (uint32_t i = 0; i < model_count; ++i) {
+        if (size - cursor < kNameSize || bytes[cursor] == 0) {
+            return false;
+        }
+        cursor += kNameSize;
+        uint32_t file_count = 0;
+        if (!read_u32(file_count) || file_count == 0 || file_count > (size - cursor) / 40) {
+            return false;
+        }
+        for (uint32_t j = 0; j < file_count; ++j) {
+            if (size - cursor < kNameSize || bytes[cursor] == 0 ||
+                std::memchr(bytes + cursor, '\0', kNameSize) == nullptr) {
+                return false;
+            }
+            cursor += kNameSize;
+            uint32_t offset = 0, length = 0;
+            if (!read_u32(offset) || !read_u32(length) || offset > size || length > size - offset ||
+                length > INT32_MAX) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+}  // namespace
+
 struct mmap_assets_table {
     char asset_name[32];   /*!< Name of the asset */
     uint32_t asset_size;   /*!< Size of the asset */
@@ -51,6 +99,9 @@ bool Assets::FindPartition(Assets* assets) {
 }
 
 bool Assets::Apply(bool refresh_display_theme) {
+    if (!partition_valid_) {
+        return false;
+    }
     return strategy_ ? strategy_->Apply(this, refresh_display_theme) : false;
 }
 
@@ -60,6 +111,14 @@ bool Assets::InitializePartition() {
 
 void Assets::UnApplyPartition() {
     UseBuiltInTextFontCapability();
+    // Caller must first fence audio and display users. Model metadata points
+    // into this mapping, so release it before the mapping itself is removed.
+    if (models_list_ != nullptr) {
+        Application::GetInstance().GetAudioService().SetModelsList(nullptr);
+        esp_srmodel_deinit(models_list_);
+        models_list_ = nullptr;
+    }
+    partition_valid_ = false;
     if (strategy_) {
         strategy_->UnApplyPartition(this);
     }
@@ -88,6 +147,10 @@ bool Assets::GetAssetData(const std::string& name, void*& ptr, size_t& size) {
 }
 
 bool Assets::LoadSrmodelsFromIndex(Assets* assets, cJSON* root) {
+    // Applying the same partition again must not free a live engine's models.
+    if (assets->models_list_ != nullptr) {
+        return true;
+    }
     void* ptr = nullptr;
     size_t size = 0;
     bool need_delete_root = false;
@@ -110,11 +173,7 @@ bool Assets::LoadSrmodelsFromIndex(Assets* assets, cJSON* root) {
     cJSON* srmodels = cJSON_GetObjectItem(root, "srmodels");
     if (cJSON_IsString(srmodels)) {
         std::string srmodels_file = srmodels->valuestring;
-        if (assets->GetAssetData(srmodels_file, ptr, size)) {
-            if (assets->models_list_ != nullptr) {
-                esp_srmodel_deinit(assets->models_list_);
-                assets->models_list_ = nullptr;
-            }
+        if (assets->GetAssetData(srmodels_file, ptr, size) && ValidateSrmodels(ptr, size)) {
             assets->models_list_ = srmodel_load(static_cast<uint8_t*>(ptr));
             if (assets->models_list_ != nullptr) {
                 auto& app = Application::GetInstance();
@@ -141,7 +200,7 @@ bool Assets::LoadSrmodelsFromIndex(Assets* assets, cJSON* root) {
 uint32_t Assets::LvglStrategy::CalculateChecksum(const char* data, uint32_t length) {
     uint32_t checksum = 0;
     for (uint32_t i = 0; i < length; i++) {
-        checksum += data[i];
+        checksum += static_cast<uint8_t>(data[i]);
     }
     return checksum & 0xFFFF;
 }
@@ -168,7 +227,9 @@ bool Assets::LvglStrategy::InitializePartition(Assets* assets) {
     uint32_t stored_chksum = *(uint32_t*)(header + 4);
     uint32_t stored_len = *(uint32_t*)(header + 8);
 
-    if (stored_len == 0 || stored_len > assets->partition_->size - 12) {
+    if (assets->partition_->size < 12 || stored_len == 0 ||
+        stored_len > assets->partition_->size - 12 ||
+        stored_files > stored_len / sizeof(mmap_assets_table)) {
         ESP_LOGD(TAG, "The stored_len (0x%lx) is greater than the partition size (0x%lx) - 12",
                  stored_len, assets->partition_->size);
         return false;
@@ -216,12 +277,27 @@ bool Assets::LvglStrategy::InitializePartition(Assets* assets) {
 
     checksum_valid_ = true;
 
+    const size_t data_offset = 12 + sizeof(mmap_assets_table) * stored_files;
+    const size_t payload_size = stored_len - sizeof(mmap_assets_table) * stored_files;
     for (uint32_t i = 0; i < stored_files; i++) {
         auto item = (const mmap_assets_table*)(mmap_root_ + 12 + i * sizeof(mmap_assets_table));
-        auto asset = Asset{.size = static_cast<size_t>(item->asset_size),
-                           .offset = static_cast<size_t>(
-                               12 + sizeof(mmap_assets_table) * stored_files + item->asset_offset)};
-        assets_[item->asset_name] = asset;
+        // Checksums alone do not validate offsets, names, or the per-file magic.
+        const std::string name(item->asset_name,
+                               strnlen(item->asset_name, sizeof(item->asset_name)));
+        if (name.empty() || assets_.count(name) != 0 || item->asset_offset > payload_size ||
+            payload_size - item->asset_offset < 2 ||
+            item->asset_size > payload_size - item->asset_offset - 2) {
+            UnApplyPartition(assets);
+            assets->partition_valid_ = false;
+            return false;
+        }
+        const size_t offset = data_offset + item->asset_offset;
+        if (mmap_root_[offset] != 'Z' || mmap_root_[offset + 1] != 'Z') {
+            UnApplyPartition(assets);
+            assets->partition_valid_ = false;
+            return false;
+        }
+        assets_[name] = Asset{.size = static_cast<size_t>(item->asset_size), .offset = offset};
     }
     return checksum_valid_;
 }
@@ -239,6 +315,9 @@ void Assets::LvglStrategy::UnApplyPartition(Assets* assets) {
 
 bool Assets::LvglStrategy::GetAssetData(Assets* assets, const std::string& name, void*& ptr,
                                         size_t& size) {
+    if (!checksum_valid_ || mmap_root_ == nullptr) {
+        return false;
+    }
     auto asset = assets_.find(name);
     if (asset == assets_.end()) {
         return false;
@@ -278,7 +357,10 @@ bool Assets::LvglStrategy::Apply(Assets* assets, bool refresh_display_theme) {
         }
     }
 
-    Assets::LoadSrmodelsFromIndex(assets, root.get());
+    if (cJSON_IsString(cJSON_GetObjectItem(root.get(), "srmodels")) &&
+        !Assets::LoadSrmodelsFromIndex(assets, root.get())) {
+        return false;
+    }
 
     // A missing or failed panel can leave a NoDisplay without initializing LVGL.
     // Keep speech models available, but do not allocate unused or unsafe UI resources.
@@ -496,8 +578,17 @@ bool Assets::Download(std::string url,
                       std::function<void(int progress, size_t speed)> progress_callback) {
     ESP_LOGI(TAG, "Downloading new version of assets from %s", url.c_str());
 
+    if (partition_ == nullptr) {
+        return false;
+    }
     auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        return false;
+    }
     auto http = network->CreateHttp(0);
+    if (!http) {
+        return false;
+    }
 
     if (auto opened = http->Open("GET", url); !opened) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", opened.error().ToString().c_str());
@@ -579,6 +670,10 @@ bool Assets::Download(std::string url,
             break;
         }
 
+        if (n < 0 || static_cast<size_t>(n) > content_length - header_collected - total_written) {
+            ESP_LOGE(TAG, "Assets response exceeds the declared length");
+            break;
+        }
         size_t buf_pos = 0;
 
         // Collect header
@@ -669,6 +764,9 @@ bool Assets::Download(std::string url,
 
     if (!success) {
         ESP_LOGE(TAG, "Assets download failed");
+        // A failed transfer may have left a valid untouched package, or an
+        // invalid partial one. Only checksum/bounds validation may remap it.
+        InitializePartition();
         return false;
     }
 

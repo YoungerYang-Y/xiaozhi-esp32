@@ -32,12 +32,18 @@ AudioService::AudioService() { event_group_ = xEventGroupCreate(); }
 AudioService::~AudioService() {
     // The optional worker owns a copy of the Ogg buffer and may still be parsing it.
     service_stopped_.store(true);
+    xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
     CancelLocalSound();
     {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.notify_all();
-        audio_queue_cv_.wait(lock, [this] { return local_sound_task_handle_ == nullptr; });
+        audio_queue_cv_.wait(lock, [this] {
+            return local_sound_task_handle_ == nullptr && audio_input_task_handle_ == nullptr &&
+                   audio_output_task_handle_ == nullptr && opus_codec_task_handle_ == nullptr;
+        });
     }
+    // Fence AFE callbacks while the service event group and queues still exist.
+    audio_engine_.reset();
     if (event_group_ != nullptr) {
         vEventGroupDelete(event_group_);
     }
@@ -89,32 +95,7 @@ void AudioService::Initialize(AudioCodec* codec) {
         }
     }
 
-#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31
-    audio_engine_ = std::make_unique<AfeAudioEngine>();
-#else
-    audio_engine_ = std::make_unique<LiteAudioEngine>();
-#endif
-    audio_engine_->OnOutput([this](std::vector<int16_t>&& data) {
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
-    });
-    audio_engine_->OnVadStateChange([this](bool speaking) {
-        if (input_paused_.load()) {
-            return;
-        }
-        voice_detected_ = speaking;
-        if (callbacks_.on_vad_change) {
-            callbacks_.on_vad_change(speaking);
-        }
-    });
-    audio_engine_->OnWakeWordDetected([this](const std::string& wake_word) {
-        if (input_paused_.load()) {
-            return;
-        }
-        xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
-        if (callbacks_.on_wake_word_detected) {
-            callbacks_.on_wake_word_detected(wake_word);
-        }
-    });
+    CreateAudioEngine();
 
     esp_timer_create_args_t audio_power_timer_args = {
         .callback =
@@ -130,11 +111,53 @@ void AudioService::Initialize(AudioCodec* codec) {
     esp_timer_create(&audio_power_timer_args, &audio_power_timer_);
 }
 
+void AudioService::CreateAudioEngine() {
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31
+    audio_engine_ = std::make_unique<AfeAudioEngine>();
+#else
+    audio_engine_ = std::make_unique<LiteAudioEngine>();
+#endif
+    audio_engine_->OnLocalCommand([this](const std::string& action, uint64_t generation) {
+        if (service_stopped_.load()) {
+            return;
+        }
+        xEventGroupClearBits(event_group_, AS_EVENT_LOCAL_COMMAND_RUNNING);
+        if (!input_paused_.load() && callbacks_.on_local_command) {
+            callbacks_.on_local_command(action, generation);
+        }
+    });
+    audio_engine_->OnOutput([this](std::vector<int16_t>&& data) {
+        if (service_stopped_.load()) {
+            return;
+        }
+        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+    });
+    audio_engine_->OnVadStateChange([this](bool speaking) {
+        if (input_paused_.load() || service_stopped_.load()) {
+            return;
+        }
+        voice_detected_ = speaking;
+        if (callbacks_.on_vad_change) {
+            callbacks_.on_vad_change(speaking);
+        }
+    });
+    audio_engine_->OnWakeWordDetected([this](const std::string& wake_word) {
+        if (input_paused_.load() || service_stopped_.load()) {
+            return;
+        }
+        xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        if (callbacks_.on_wake_word_detected) {
+            callbacks_.on_wake_word_detected(wake_word);
+        }
+    });
+}
+
 void AudioService::Start() {
     service_stopped_.store(false);
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                                            AS_EVENT_AUDIO_PROCESSOR_RUNNING |
-                                           AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
+                                           AS_EVENT_AUDIO_INPUT_STOP_REQUEST |
+                                           AS_EVENT_LOCAL_COMMAND_RUNNING);
 
     esp_timer_start_periodic(audio_power_timer_, 1000000);
 
@@ -144,6 +167,11 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->AudioInputTask();
+            {
+                std::lock_guard<std::mutex> lock(audio_service->audio_queue_mutex_);
+                audio_service->audio_input_task_handle_ = nullptr;
+                audio_service->audio_queue_cv_.notify_all();
+            }
             vTaskDelete(NULL);
         },
         "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
@@ -153,6 +181,11 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->AudioOutputTask();
+            {
+                std::lock_guard<std::mutex> lock(audio_service->audio_queue_mutex_);
+                audio_service->audio_output_task_handle_ = nullptr;
+                audio_service->audio_queue_cv_.notify_all();
+            }
             vTaskDelete(NULL);
         },
         "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);
@@ -162,6 +195,11 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->AudioInputTask();
+            {
+                std::lock_guard<std::mutex> lock(audio_service->audio_queue_mutex_);
+                audio_service->audio_input_task_handle_ = nullptr;
+                audio_service->audio_queue_cv_.notify_all();
+            }
             vTaskDelete(NULL);
         },
         "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_);
@@ -171,6 +209,11 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->AudioOutputTask();
+            {
+                std::lock_guard<std::mutex> lock(audio_service->audio_queue_mutex_);
+                audio_service->audio_output_task_handle_ = nullptr;
+                audio_service->audio_queue_cv_.notify_all();
+            }
             vTaskDelete(NULL);
         },
         "audio_output", 2048, this, 4, &audio_output_task_handle_);
@@ -181,6 +224,11 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->OpusCodecTask();
+            {
+                std::lock_guard<std::mutex> lock(audio_service->audio_queue_mutex_);
+                audio_service->opus_codec_task_handle_ = nullptr;
+                audio_service->audio_queue_cv_.notify_all();
+            }
             vTaskDelete(NULL);
         },
         "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
@@ -209,6 +257,13 @@ void AudioService::Stop() {
     if (notify_drained && callbacks_.on_playback_drained) {
         callbacks_.on_playback_drained();
     }
+    // Stop is used for shutdown/update paths. Join service tasks before callers
+    // free codecs or later restart; no second capture task may outlive this one.
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    audio_queue_cv_.wait(lock, [this] {
+        return local_sound_task_handle_ == nullptr && audio_input_task_handle_ == nullptr &&
+               audio_output_task_handle_ == nullptr && opus_codec_task_handle_ == nullptr;
+    });
 }
 
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
@@ -258,7 +313,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     last_input_time_ = std::chrono::steady_clock::now();
     debug_statistics_.input_count++;
 
-#if CONFIG_USE_AUDIO_DEBUGGER
+#if CONFIG_USE_AUDIO_DEBUGGER && !CONFIG_HOME_OFFLINE
     std::lock_guard<std::mutex> feed_lock(capture_feed_mutex_);
     if (generation != capture_generation_.load() || input_paused_.load()) {
         return false;
@@ -274,9 +329,9 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 }
 
 void AudioService::AudioInputTask() {
-    constexpr EventBits_t kAudioInputActiveBits = AS_EVENT_AUDIO_TESTING_RUNNING |
-                                                  AS_EVENT_WAKE_WORD_RUNNING |
-                                                  AS_EVENT_AUDIO_PROCESSOR_RUNNING;
+    constexpr EventBits_t kAudioInputActiveBits =
+        AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
+        AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_LOCAL_COMMAND_RUNNING;
 
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(
@@ -312,9 +367,18 @@ void AudioService::AudioInputTask() {
             continue;
         }
 
-        const uint32_t capture_generation = capture_generation_.load();
-        if (input_paused_.load()) {
-            continue;
+        uint32_t capture_generation;
+        {
+            // WaitBits can return an active bit immediately before an update
+            // clears it. Snapshot the current bits and generation under the
+            // reset/feed fence so stale wakeups cannot start a read in the
+            // resource-update gap and feed it into a later session.
+            std::lock_guard<std::mutex> feed_lock(capture_feed_mutex_);
+            bits = xEventGroupGetBits(event_group_);
+            capture_generation = capture_generation_.load();
+            if (input_paused_.load() || (bits & kAudioInputActiveBits) == 0) {
+                continue;
+            }
         }
 
         /* Used for audio testing in NetworkConfiguring mode by clicking the BOOT button */
@@ -351,14 +415,16 @@ void AudioService::AudioInputTask() {
         }
 
         /* Feed the selected audio engine */
-        if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
+        if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                    AS_EVENT_LOCAL_COMMAND_RUNNING)) {
             int samples = 160;  // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
                 std::lock_guard<std::mutex> feed_lock(capture_feed_mutex_);
                 if (capture_generation != capture_generation_.load() || input_paused_.load() ||
                     !(xEventGroupGetBits(event_group_) &
-                      (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING))) {
+                      (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                       AS_EVENT_LOCAL_COMMAND_RUNNING))) {
                     continue;
                 }
                 audio_engine_->Feed(std::move(data));
@@ -776,15 +842,18 @@ void AudioService::EncodeWakeWord() {
 }
 
 const std::string& AudioService::GetLastWakeWord() const {
+    std::lock_guard<std::mutex> lock(capture_control_mutex_);
     static const std::string empty;
     return audio_engine_ ? audio_engine_->GetLastDetectedWakeWord() : empty;
 }
 
 std::vector<std::string> AudioService::GetWakeWords() const {
+    std::lock_guard<std::mutex> lock(capture_control_mutex_);
     return audio_engine_initialized_ ? audio_engine_->GetWakeWords() : std::vector<std::string>{};
 }
 
 std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
     const uint32_t generation = capture_generation_.load();
     auto packet = std::make_unique<AudioStreamPacket>();
     if (audio_engine_ && audio_engine_->GetWakeWordOpus(packet->payload)) {
@@ -796,13 +865,90 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
     return nullptr;
 }
 
+bool AudioService::HasLocalCommands() {
+    std::lock_guard<std::mutex> lock(capture_control_mutex_);
+    return !asset_update_prepared_ && InitializeAudioEngine() && audio_engine_->HasLocalCommands();
+}
+
+bool AudioService::StartLocalCommands(uint64_t generation) {
+    std::lock_guard<std::mutex> lock(capture_control_mutex_);
+    if (generation == 0 || input_paused_.load() || asset_update_prepared_ ||
+        !InitializeAudioEngine() || !audio_engine_->HasLocalCommands()) {
+        return false;
+    }
+    ResetCaptureLocked();
+    {
+        std::lock_guard<std::mutex> resampler_lock(input_resampler_mutex_);
+        if (input_resampler_ != nullptr) {
+            esp_ae_rate_cvt_reset(input_resampler_);
+        }
+    }
+    if (!audio_engine_->StartLocalCommands(generation)) {
+        return false;
+    }
+    xEventGroupSetBits(event_group_, AS_EVENT_LOCAL_COMMAND_RUNNING);
+    return true;
+}
+
+void AudioService::StopLocalCommands() {
+    std::lock_guard<std::mutex> lock(capture_control_mutex_);
+    if (audio_engine_initialized_) {
+        audio_engine_->StopLocalCommands();
+    }
+    xEventGroupClearBits(event_group_, AS_EVENT_LOCAL_COMMAND_RUNNING);
+}
+
+bool AudioService::PrepareForAssetUpdate() {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
+    asset_update_prepared_ = true;
+    ResetCaptureLocked();
+    CancelLocalSound();
+    ResetDecoder();
+    {
+        std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        if (!audio_queue_cv_.wait_for(lock, std::chrono::seconds(3), [this] {
+                // The prompt worker owns a copy of its bytes and stays resident
+                // while idle. Its completed request, rather than task deletion,
+                // fences any prompt playback or retained request data.
+                return IsPlaybackDrainedLocked() && !IsLocalSoundBusy();
+            })) {
+            return false;
+        }
+    }
+    // Reads already in flight are rejected at capture_feed_mutex_; no task may
+    // retain the old engine across this fence. Its destructor joins AFE fetch
+    // and the optional wake-word encoder before models can be unmapped.
+    std::lock_guard<std::mutex> feed_lock(capture_feed_mutex_);
+    audio_engine_.reset();
+    audio_engine_initialized_ = false;
+    return true;
+}
+
+void AudioService::ResumeAfterAssetUpdate() {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
+    if (!asset_update_prepared_) {
+        return;
+    }
+    if (!audio_engine_) {
+        CreateAudioEngine();
+    }
+    asset_update_prepared_ = false;
+    // Rebuild now, but leave every capture bit off. Application restores only
+    // the current idle mode and current external input-paused preference.
+    InitializeAudioEngine();
+}
+
 void AudioService::EnableWakeWordDetection(bool enable) {
     std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
-    if (enable && input_paused_.load()) {
+    if (enable && (input_paused_.load() || asset_update_prepared_)) {
         return;
     }
     ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
     if (enable) {
+        if (audio_engine_initialized_) {
+            audio_engine_->StopLocalCommands();
+        }
+        xEventGroupClearBits(event_group_, AS_EVENT_LOCAL_COMMAND_RUNNING);
         if (!InitializeAudioEngine()) {
             xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
             return;
@@ -841,7 +987,8 @@ void AudioService::ReleaseWakeWordResources() {
         return;
     }
     if (xEventGroupGetBits(event_group_) &
-        (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
+        (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+         AS_EVENT_LOCAL_COMMAND_RUNNING)) {
         ESP_LOGW(TAG, "Cannot release WakeNet while the audio engine is active");
         return;
     }
@@ -851,12 +998,16 @@ void AudioService::ReleaseWakeWordResources() {
 
 void AudioService::EnableVoiceProcessing(bool enable) {
     std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
-    if (enable && input_paused_.load()) {
+    if (enable && (input_paused_.load() || asset_update_prepared_)) {
         return;
     }
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
 
     if (enable) {
+        if (audio_engine_initialized_) {
+            audio_engine_->StopLocalCommands();
+        }
+        xEventGroupClearBits(event_group_, AS_EVENT_LOCAL_COMMAND_RUNNING);
         if (!InitializeAudioEngine()) {
             return;
         }
@@ -883,7 +1034,7 @@ void AudioService::EnableVoiceProcessing(bool enable) {
 
 void AudioService::EnableAudioTesting(bool enable) {
     std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
-    if (input_paused_.load()) {
+    if (input_paused_.load() || asset_update_prepared_) {
         return;
     }
     ESP_LOGI(TAG, "%s audio testing", enable ? "Enabling" : "Disabling");
@@ -920,7 +1071,8 @@ void AudioService::ResetCapture() {
 void AudioService::ResetCaptureLocked() {
     std::lock_guard<std::mutex> feed_lock(capture_feed_mutex_);
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
-                                           AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+                                           AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                                           AS_EVENT_LOCAL_COMMAND_RUNNING);
     if (audio_engine_initialized_) {
         audio_engine_->ResetCapture();
     }
@@ -943,6 +1095,7 @@ void AudioService::ResetCaptureLocked() {
 }
 
 void AudioService::EnableDeviceAec(bool enable) {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
     ESP_LOGI(TAG, "%s device AEC", enable ? "Enabling" : "Disabling");
     device_aec_enabled_ = enable;
 
@@ -957,12 +1110,13 @@ void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) { callbacks_ =
 
 bool AudioService::TryPlayLocalSound(std::string_view sound, uint32_t id) {
     if (id == 0 || sound.empty() || sound.size() > kLocalSoundMaxBytes || codec_ == nullptr ||
-        !codec_->SupportsCheckedOutput() || service_stopped_.load()) {
+        !codec_->SupportsCheckedOutput() || service_stopped_.load() ||
+        asset_update_prepared_.load()) {
         return false;
     }
     std::unique_lock<std::mutex> lock(audio_queue_mutex_, std::try_to_lock);
     if (!lock.owns_lock() || IsLocalSoundBusy() || !IsPlaybackDrainedLocked() ||
-        service_stopped_.load()) {
+        service_stopped_.load() || asset_update_prepared_.load()) {
         return false;
     }
     auto data = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[sound.size()]);
@@ -1310,6 +1464,7 @@ void AudioService::CheckAndUpdateAudioPowerState() {
 }
 
 void AudioService::SetModelsList(srmodel_list_t* models_list) {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
     if (audio_engine_initialized_ && models_list_ != models_list) {
         ESP_LOGW(TAG, "Ignoring speech model replacement after audio engine initialization");
         return;
@@ -1318,6 +1473,7 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
 }
 
 bool AudioService::IsAfeWakeWord() {
+    std::lock_guard<std::mutex> control_lock(capture_control_mutex_);
     return audio_engine_initialized_ && audio_engine_->IsAfeWakeWord();
 }
 

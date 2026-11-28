@@ -52,6 +52,7 @@
 #define AS_EVENT_AUDIO_TESTING_RUNNING (1 << 0)
 #define AS_EVENT_WAKE_WORD_RUNNING (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING (1 << 2)
+#define AS_EVENT_LOCAL_COMMAND_RUNNING (1 << 3)
 #define AS_EVENT_AUDIO_INPUT_STOP_REQUEST (1 << 4)
 
 #define AS_OPUS_GET_FRAME_DRU_ENUM(duration_ms)                  \
@@ -84,6 +85,7 @@ struct AudioServiceCallbacks {
     std::function<void(void)> on_send_queue_available;
     std::function<void(const std::string&)> on_wake_word_detected;
     std::function<void(bool)> on_vad_change;
+    std::function<void(const std::string&, uint64_t)> on_local_command;
     std::function<void(void)> on_audio_testing_queue_full;
     // Fired when the decode/playback queues and their in-flight work are drained.
     std::function<void(void)> on_playback_drained;
@@ -158,6 +160,13 @@ public:
     }
     bool IsAfeWakeWord();
 
+    bool HasLocalCommands();
+    bool StartLocalCommands(uint64_t generation);
+    void StopLocalCommands();
+    // Worker-only update fence. Application owns admission and restores capture
+    // after Resume; the user's persistent input pause is never changed here.
+    bool PrepareForAssetUpdate();
+    void ResumeAfterAssetUpdate();
     void EnableWakeWordDetection(bool enable);
     void ReleaseWakeWordResources();
     void EnableVoiceProcessing(bool enable);
@@ -252,7 +261,8 @@ private:
     // Lock order: control -> feed -> engine callback/input -> audio_queue.
     // Never hold feed while waiting for codec input, AFE fetch or Opus encoding.
     // Engine callbacks only enqueue/post events; they must not take control.
-    std::mutex capture_control_mutex_;
+    mutable std::mutex capture_control_mutex_;
+    std::atomic<bool> asset_update_prepared_{false};
     std::mutex capture_feed_mutex_;
     // For server AEC
     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
@@ -275,6 +285,7 @@ private:
     void AudioOutputTask();
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    void CreateAudioEngine();
     bool InitializeAudioEngine();
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();

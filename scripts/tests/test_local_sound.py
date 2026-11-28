@@ -192,6 +192,7 @@ int main(int argc,char** argv) {
         audio.decoder_sample_rate_=16000;
         auto callbacks=receipts.Callbacks(); audio.SetCallbacks(callbacks);
         std::thread decoder, output;
+        std::future<void> stop_waiter;
         auto run=[&] {
             decoder=std::thread([&] { audio.OpusCodecTask(); });
             output=std::thread([&] { audio.AudioOutputTask(); });
@@ -227,7 +228,10 @@ int main(int argc,char** argv) {
             } else if(scenario.find("write-before-")==0) {
                 post_write_gate.Until(1);
                 if(scenario=="write-before-reset") audio.ResetDecoder();
-                else if(scenario=="write-before-stop") audio.Stop();
+                else if(scenario=="write-before-stop") {
+                    stop_waiter=std::async(std::launch::async,[&] { audio.Stop(); });
+                    assert(stop_waiter.wait_for(30ms)==std::future_status::timeout);
+                }
                 else audio.CancelLocalSound();
                 receipts.NoFinishedFor();
                 assert(audio.IsLocalSoundBusy());
@@ -243,6 +247,7 @@ int main(int argc,char** argv) {
                 decode_gate.Release();
             }
             receipts.Finished(1); idle(audio);
+            if (stop_waiter.valid()) stop_waiter.get();
             assert(!receipts.finishes[0].second);
             bool wrote=scenario=="latch-before-cancel" || scenario.find("write-before-")==0;
             assert(receipts.starts.size()==(wrote?1:0));
@@ -284,7 +289,10 @@ int main(int argc,char** argv) {
             commit_hold_visit=1;
             assert(audio.TryPlayLocalSound(ogg(),1)); commit_gate.Until(1);
             if (scenario=="reset-before-commit") audio.ResetDecoder();
-            if (scenario=="stop-before-commit") audio.Stop();
+            if (scenario=="stop-before-commit") {
+                stop_waiter=std::async(std::launch::async,[&] { audio.Stop(); });
+                assert(stop_waiter.wait_for(30ms)==std::future_status::timeout);
+            }
             if (scenario=="cancel-queue-wait" || scenario=="cancel-lost-wakeup") {
                 std::lock_guard<std::mutex> lock(audio.audio_queue_mutex_);
                 for(int i=0;i<MAX_DECODE_PACKETS_IN_QUEUE;++i)
@@ -308,6 +316,7 @@ int main(int argc,char** argv) {
                 scenario=="cancel-queue-wait" || scenario=="cancel-lost-wakeup" ? 20:0));
             audio.audio_decode_queue_.clear();
             if(scenario=="stop-before-commit") {
+                stop_waiter.get();
                 std::unique_lock<std::mutex> lock(audio.audio_queue_mutex_);
                 assert(audio.audio_queue_cv_.cv.wait_for(lock,3s,[&] { return audio.local_sound_task_handle_==nullptr; }));
                 audio.service_stopped_=false;
