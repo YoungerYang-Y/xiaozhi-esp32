@@ -1,0 +1,3 @@
+[tools]
+# Match the Python minor version of the existing ESP-IDF virtual environment.
+python = "3.12.16"
