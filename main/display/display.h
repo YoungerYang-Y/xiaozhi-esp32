@@ -52,6 +52,10 @@ public:
     // Remove a matching message without clearing newer content, when supported.
     virtual void RemoveChatMessage(const char* role, const char* content) {}
     virtual void ClearChatMessages();
+    virtual void ShowNetworkMenu(const std::vector<std::string>& items, int selected) {}
+    virtual int NetworkMenuHitTest(int x, int y) { return -1; }
+    // True only after all display consumers have released mapped resource data.
+    virtual bool PrepareForAssetUpdate() { return false; }
     virtual void SetTheme(Theme* theme);
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);

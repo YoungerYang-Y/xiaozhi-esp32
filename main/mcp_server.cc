@@ -138,14 +138,25 @@ bool ValidVisionConfig(const McpRequestContext::VisionConfig& vision) {
 }
 }  // namespace
 
-void McpServer::ParseMessage(const std::string& message, ResponseSender response_sender) {
+void McpServer::ParseMessage(const std::string& message, ResponseSender response_sender,
+                             RequestGuard request_guard) {
+    if (request_guard && !request_guard()) {
+        return;
+    }
     CJsonUniquePtr json(cJSON_ParseWithOpts(message.c_str(), nullptr, true));
     if (json == nullptr) {
         // Requests may contain credentials. Never log the original message.
-        ReplyError({}, -32700, "Parse error", response_sender);
+        auto guarded_sender = [this, response_sender = std::move(response_sender),
+                               request_guard =
+                                   std::move(request_guard)](const std::string& payload) {
+            if (!request_guard || request_guard()) {
+                SendResponse(payload, response_sender);
+            }
+        };
+        ReplyError({}, -32700, "Parse error", guarded_sender);
         return;
     }
-    ParseMessage(json.get(), std::move(response_sender));
+    ParseMessage(json.get(), std::move(response_sender), std::move(request_guard));
 }
 
 void McpServer::ParseCapabilities(const cJSON* capabilities) {
@@ -157,7 +168,19 @@ void McpServer::ParseCapabilities(const cJSON* capabilities) {
     }
 }
 
-void McpServer::ParseMessage(const cJSON* json, ResponseSender response_sender) {
+void McpServer::ParseMessage(const cJSON* json, ResponseSender response_sender,
+                             RequestGuard request_guard) {
+    if (request_guard) {
+        if (!request_guard()) {
+            return;
+        }
+        response_sender = [this, sender = std::move(response_sender),
+                           request_guard](const std::string& payload) {
+            if (request_guard()) {
+                SendResponse(payload, sender);
+            }
+        };
+    }
     McpRequestContext context;
     auto id = cJSON_GetObjectItemCaseSensitive(json, "id");
     if (cJSON_IsString(id)) {
@@ -279,7 +302,8 @@ void McpServer::ParseMessage(const cJSON* json, ResponseSender response_sender) 
                 return;
             }
         }
-        DoToolCall(std::move(context), std::move(tool), arguments, std::move(response_sender));
+        DoToolCall(std::move(context), std::move(tool), arguments, std::move(response_sender),
+                   std::move(request_guard));
     } else {
         ReplyError(context, -32601, "Method not implemented: " + std::string(method_name),
                    response_sender);
@@ -404,7 +428,8 @@ void McpServer::GetToolsList(const McpRequestContext& context, const std::string
 }
 
 void McpServer::DoToolCall(McpRequestContext context, std::shared_ptr<McpTool> tool,
-                           const cJSON* tool_arguments, ResponseSender response_sender) {
+                           const cJSON* tool_arguments, ResponseSender response_sender,
+                           RequestGuard request_guard) {
     PropertyList arguments = tool->properties();
     for (auto& argument : arguments) {
         bool found = false;
@@ -442,8 +467,15 @@ void McpServer::DoToolCall(McpRequestContext context, std::shared_ptr<McpTool> t
     }
     Application::GetInstance().Schedule([this, context = std::move(context), tool = std::move(tool),
                                          arguments = std::move(arguments),
-                                         response_sender = std::move(response_sender)]() {
+                                         response_sender = std::move(response_sender),
+                                         request_guard = std::move(request_guard)]() {
+        if (request_guard && !request_guard()) {
+            return;
+        }
         auto result = tool->Call(arguments, context);
+        if (request_guard && !request_guard()) {
+            return;
+        }
         if (!result) {
             if (context.modern) {
                 std::string error = "{\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":";

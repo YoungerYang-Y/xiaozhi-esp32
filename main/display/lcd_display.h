@@ -33,6 +33,9 @@ protected:
     lv_obj_t* chat_message_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+    lv_obj_t* network_menu_ = nullptr;
+    std::vector<lv_obj_t*> network_menu_rows_;
+    std::atomic<uint32_t> network_menu_generation_{0};
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
 
     void InitializeLcdThemes();
@@ -53,6 +56,11 @@ public:
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void RemoveChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;
+    virtual void ShowNetworkMenu(const std::vector<std::string>& items, int selected) override;
+    virtual int NetworkMenuHitTest(int x, int y) override;
+    virtual bool PrepareForAssetUpdate() override;
+    // Only visibility changes advance the token. Odd tokens denote an open menu.
+    uint64_t NetworkMenuGeneration() const { return network_menu_generation_.load(); }
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
     virtual void SetupUI() override;
     // Add theme switching function

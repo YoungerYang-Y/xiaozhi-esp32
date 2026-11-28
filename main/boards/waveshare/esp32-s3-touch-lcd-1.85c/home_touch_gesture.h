@@ -11,7 +11,8 @@ public:
     // Called with monotonic time and one complete controller sample. A trigger is
     // emitted only on the second release; the following burst is consumed until
     // the screen has been untouched for a full double-tap window.
-    bool Update(uint64_t now_ms, bool read_ok, uint8_t points, uint16_t x = 0, uint16_t y = 0) {
+    bool Update(uint64_t now_ms, bool read_ok, uint8_t points, uint16_t x = 0, uint16_t y = 0,
+                bool menu = false) {
         if (!read_ok || points > 1) {
             touching_ = false;
             first_tap_pending_ = false;
@@ -59,6 +60,11 @@ public:
             first_tap_pending_ = false;
             return false;
         }
+        // Menu rows use a complete short tap, never the double-tap backlight gesture.
+        if (menu) {
+            first_tap_pending_ = false;
+            return true;
+        }
         if (first_tap_pending_ && Near(start_x_, start_y_, first_x_, first_y_) &&
             Near(last_x_, last_y_, first_x_, first_y_)) {
             first_tap_pending_ = false;
@@ -72,6 +78,24 @@ public:
         first_y_ = start_y_;
         return false;
     }
+
+    bool UpdateMenu(uint64_t now_ms, bool read_ok, uint8_t points, uint16_t x = 0, uint16_t y = 0) {
+        return Update(now_ms, read_ok, points, x, y, true);
+    }
+
+    void Reset() {
+        *this = HomeTouchGesture();
+        discard_until_release_ = true;
+    }
+
+    void ResetForMenuChange() {
+        const bool active = touching_ || discard_until_release_;
+        Reset();
+        discard_until_release_ = active;
+    }
+
+    uint16_t tap_x() const { return last_x_; }
+    uint16_t tap_y() const { return last_y_; }
 
     bool NeedsPolling() const {
         return touching_ || first_tap_pending_ || suppress_burst_ || discard_until_release_;

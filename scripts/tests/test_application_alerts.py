@@ -508,7 +508,7 @@ struct Application {
         install += 'void Application::InstallHealthCallback(uint32_t callback_epoch) {\n'
         install += definition(source, "protocol_->OnHealthEvent([this, callback_epoch]") + '); }\n#endif\n'
         install += 'void Application::PlaybackDrained() {\n'
-        drain = definition(source, "if (bits & MAIN_EVENT_PLAYBACK_DRAINED)")
+        drain = definition(source, "if ((bits & MAIN_EVENT_PLAYBACK_DRAINED)")
         install += drain[drain.index('{') + 1:-1] + '\n}\n'
         install += 'void Application::TtsStopped() { const auto token = accepted_channel_token_.load();\n'
         install += 'const auto pause_sequence = ListeningPauseSequence();\n'

@@ -1,5 +1,6 @@
 #include "lcd_display.h"
 #include "assets/lang_config.h"
+#include "dynamic_glyph_cache.h"
 #include "gif/lvgl_gif.h"
 #include "lvgl_theme.h"
 #include "settings.h"
@@ -11,6 +12,9 @@
 #include <esp_psram.h>
 #include <material_symbols.h>
 #include <noto_emoji.h>
+#include <src/draw/lv_draw.h>
+#include <src/misc/cache/instance/lv_image_cache.h>
+#include <src/misc/cache/instance/lv_image_header_cache.h>
 #include <src/misc/cache/lv_cache.h>
 #include <algorithm>
 #include <cstdio>
@@ -484,6 +488,9 @@ void LcdDisplay::UpdateHomeLayout(LvglTheme* theme) {
         lv_obj_set_height(label, font->line_height);
         lv_obj_center(label);
     }
+    // The asset-update barrier gives every object a local built-in font style.
+    lv_obj_set_style_text_font(bottom_bar_, text_font, 0);
+    lv_obj_set_style_text_font(chat_message_label_, text_font, 0);
     lv_obj_set_size(bottom_bar_, kFooterWidth, subtitle_height);
     lv_obj_align(bottom_bar_, LV_ALIGN_TOP_MID, 0, subtitle_top);
     lv_obj_set_width(chat_message_label_, kFooterWidth);
@@ -1694,5 +1701,182 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
     }
 #if CONFIG_WAVESHARE_1_85C_HOME
     UpdateHomeLayout(static_cast<LvglTheme*>(current_theme_));
+#endif
+}
+
+void LcdDisplay::ShowNetworkMenu(const std::vector<std::string>& items, int selected) {
+    DisplayLockGuard lock(this);
+    if (!lock || display_ == nullptr || !setup_ui_called_) {
+        return;
+    }
+    const bool was_open = network_menu_ != nullptr;
+    if (items.empty()) {
+        if (network_menu_ != nullptr) {
+            lv_obj_delete(network_menu_);
+            network_menu_ = nullptr;
+            network_menu_rows_.clear();
+            network_menu_generation_.fetch_add(1);
+        }
+        return;
+    }
+    if (network_menu_ == nullptr) {
+        network_menu_ = lv_obj_create(lv_display_get_layer_top(display_));
+        lv_obj_set_size(network_menu_, width_, height_);
+        lv_obj_set_pos(network_menu_, 0, 0);
+        lv_obj_set_style_pad_all(network_menu_, 0, 0);
+        lv_obj_set_style_border_width(network_menu_, 0, 0);
+        lv_obj_set_style_radius(network_menu_, 0, 0);
+        lv_obj_set_style_bg_opa(network_menu_, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(network_menu_, lv_color_hex(0x101820), 0);
+        lv_obj_remove_flag(network_menu_, LV_OBJ_FLAG_SCROLLABLE);
+    }
+    lv_obj_clean(network_menu_);
+    network_menu_rows_.clear();
+    // Four 44px rows in a centered 240px chord fit a 360px circular panel.
+    const int count = std::min<int>(items.size(), 4);
+    const int row_height = std::min(44, height_ / 6);
+    const int row_gap = 6;
+    const int menu_width = width_ * 2 / 3;
+    const int top = (height_ - count * (row_height + row_gap) + row_gap) / 2;
+    const lv_font_t* font = &BUILTIN_TEXT_FONT;
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    if (theme != nullptr && theme->text_font() != nullptr &&
+        theme->text_font()->font()->line_height <= row_height - 4) {
+        font = theme->text_font()->font();
+    }
+    bool has_menu_glyphs = true;
+    for (const char32_t* ch = U"离线使用保持进入配网立即重试恢复联网返回"; *ch != 0; ++ch) {
+        lv_font_glyph_dsc_t glyph;
+        if (!lv_font_get_glyph_dsc(font, &glyph, *ch, 0)) {
+            has_menu_glyphs = false;
+            break;
+        }
+    }
+    for (int i = 0; i < count; ++i) {
+        auto row = lv_obj_create(network_menu_);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, menu_width, row_height);
+        lv_obj_set_pos(row, (width_ - menu_width) / 2, top + i * (row_height + row_gap));
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(row, lv_color_hex(i == selected ? 0x286F9B : 0x263440), 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        auto label = lv_label_create(row);
+        lv_obj_set_style_text_font(label, font, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_width(label, menu_width - 12);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        const char* text = items[i].c_str();
+        // Basic firmware fonts need not contain the new menu's Chinese glyphs.
+        // Keep recovery operable even after the optional font partition is lost.
+        if (!has_menu_glyphs) {
+            if (items[i] == "离线使用" || items[i] == "保持离线") {
+                text = "Offline";
+            } else if (items[i] == "进入配网") {
+                text = "Wi-Fi setup";
+            } else if (items[i] == "立即重试") {
+                text = "Retry now";
+            } else if (items[i] == "恢复联网") {
+                text = "Reconnect";
+            } else if (items[i] == "返回") {
+                text = "Back";
+            }
+        }
+        lv_label_set_text(label, text);
+        lv_obj_center(label);
+        network_menu_rows_.push_back(row);
+    }
+    lv_obj_move_foreground(network_menu_);
+    lv_obj_update_layout(network_menu_);
+    if (!was_open) {
+        network_menu_generation_.fetch_add(1);
+    }
+}
+
+int LcdDisplay::NetworkMenuHitTest(int x, int y) {
+    DisplayLockGuard lock(this);
+    if (!lock || network_menu_ == nullptr || x < 0 || y < 0 || x >= width_ || y >= height_) {
+        return -1;
+    }
+    lv_obj_update_layout(network_menu_);
+    for (size_t i = 0; i < network_menu_rows_.size(); ++i) {
+        lv_area_t area;
+        lv_obj_get_coords(network_menu_rows_[i], &area);
+        if (x >= area.x1 && x <= area.x2 && y >= area.y1 && y <= area.y2) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+bool LcdDisplay::PrepareForAssetUpdate() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    DisplayLockGuard lock(this);
+    if (!lock || !setup_ui_called_ || display_ == nullptr || current_theme_ == nullptr ||
+        container_ == nullptr || emoji_image_ == nullptr || preview_image_ == nullptr ||
+        emoji_label_ == nullptr || emoji_box_ == nullptr) {
+        return false;
+    }
+    // Finish render work before destroying descriptors which may still be in draw tasks.
+    lv_draw_wait_for_finish();
+    if (preview_timer_ != nullptr) {
+        esp_timer_stop(preview_timer_);
+    }
+    if (gif_controller_ != nullptr) {
+        gif_controller_->Stop();
+    }
+    lv_image_set_src(emoji_image_, nullptr);
+    lv_image_set_src(preview_image_, nullptr);
+    lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+    emotion_uses_image_ = false;
+    // Styles store raw font/image pointers. Rebind the complete HOME object tree,
+    // including the menu layer, before releasing any shared resource owner.
+    auto detach = [](lv_obj_t* obj, void*) {
+        lv_obj_set_style_text_font(obj, &BUILTIN_TEXT_FONT, 0);
+        lv_obj_set_style_bg_image_src(obj, nullptr, 0);
+        return LV_OBJ_TREE_WALK_NEXT;
+    };
+    lv_obj_tree_walk(lv_display_get_screen_active(display_), detach, nullptr);
+    lv_obj_tree_walk(lv_display_get_layer_top(display_), detach, nullptr);
+    lv_obj_tree_walk(lv_display_get_layer_sys(display_), detach, nullptr);
+    lv_obj_tree_walk(lv_display_get_layer_bottom(display_), detach, nullptr);
+    lv_image_cache_drop(nullptr);
+    lv_image_header_cache_drop(nullptr);
+    gif_controller_.reset();
+    preview_image_cached_.reset();
+    ClearTextGlyphs();
+    auto text = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
+    auto icon = std::make_shared<LvglBuiltInFont>(&BUILTIN_ICON_FONT);
+    auto large_icon = std::make_shared<LvglBuiltInFont>(&font_material_symbols_30_4);
+    auto emoji = std::make_shared<LvglBuiltInFont>(&font_noto_emoji_30_4);
+    auto reset_theme = [&](LvglTheme* theme) {
+        if (theme == nullptr) {
+            return;
+        }
+        if (theme->text_font() != nullptr) {
+            theme->text_font()->SetFallback(nullptr);
+        }
+        theme->set_text_font(text);
+        theme->set_icon_font(icon);
+        theme->set_large_icon_font(large_icon);
+        theme->set_emoji_font(emoji);
+        theme->set_background_image(nullptr);
+        theme->set_emoji_collection(nullptr);
+    };
+    auto& themes = LvglThemeManager::GetInstance();
+    reset_theme(themes.GetTheme("light"));
+    reset_theme(themes.GetTheme("dark"));
+    reset_theme(static_cast<LvglTheme*>(current_theme_));
+    SetTheme(current_theme_);
+    lv_obj_set_style_text_font(emoji_label_, large_icon->font(), 0);
+    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_ROBOT_2);
+    lv_obj_remove_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    return true;
+#else
+    // Other LCD layouts can retain extra resources in board-specific widgets.
+    return false;
 #endif
 }

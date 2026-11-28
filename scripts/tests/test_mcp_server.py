@@ -223,6 +223,16 @@ class McpServerTest(unittest.TestCase):
             #include "press_to_talk_mcp_tool.h"
             #include "board.h"
             #include "nvs.h"
+            uint64_t request_generation = 0;
+            bool cancel_on_next_json_allocation = false;
+            // Cancel inside the real parser/serializer without timing-dependent threads.
+            void* AllocateJson(size_t size) {
+                if (cancel_on_next_json_allocation) {
+                    cancel_on_next_json_allocation = false;
+                    ++request_generation;
+                }
+                return std::malloc(size);
+            }
             int main(int argc, char** argv) {
                 auto& server = McpServer::GetInstance();
                 const std::string mode = argc > 2 ? argv[2] : "";
@@ -242,6 +252,14 @@ class McpServerTest(unittest.TestCase):
                     server.AddTool("test.image", "Return image", PropertyList(),
                         [](const PropertyList&) -> ToolResult {
                             return new ImageContent("image/jpeg", "abc");
+                        });
+                    server.AddTool("test.invalidate", "Cancel while running",
+                        PropertyList({Property("fail", kPropertyTypeBoolean)}),
+                        [](const PropertyList& args) -> ToolResult {
+                            ++request_generation;
+                            Board::GetInstance().GetCamera()->Capture();
+                            if (args["fail"].value<bool>()) return std::unexpected("cancelled");
+                            return true;
                         });
                     server.AddTool("test.captures", "Capture count", PropertyList(),
                         [](const PropertyList&) -> ToolResult {
@@ -284,15 +302,40 @@ class McpServerTest(unittest.TestCase):
                         std::cout << "custom\t" << payload << '\n';
                     };
                 }
+                bool cancel_next_request = mode.ends_with("-parse-cancel");
+                if (cancel_next_request) {
+                    cJSON_Hooks hooks{AllocateJson, std::free};
+                    cJSON_InitHooks(&hooks);
+                }
                 std::string request;
                 while (std::getline(std::cin, request)) {
                     if (request == ":set-key" || request == ":clear-key") {
                         if (McpTools::SaveTavilyApiKey(request == ":set-key" ? "tvly-host-test" : "") !=
                             ESP_OK) std::abort();
+                    } else if (request == ":invalidate") {
+                        ++request_generation;
+                    } else if (mode.starts_with("guarded-")) {
+                        auto guard = [&, generation = request_generation] {
+                            return generation == request_generation;
+                        };
+                        if (mode.starts_with("guarded-json-")) {
+                            CJsonUniquePtr json(cJSON_Parse(request.c_str()));
+                            // The cJSON overload must also retain the ingress identity while
+                            // decoding request metadata (the string ID allocates here).
+                            cancel_on_next_json_allocation = cancel_next_request;
+                            server.ParseMessage(json.get(), sender, guard);
+                        } else {
+                            cancel_on_next_json_allocation = cancel_next_request;
+                            server.ParseMessage(request, sender, guard);
+                        }
+                        if (cancel_on_next_json_allocation) std::abort();
+                        cancel_next_request = false;
                     } else {
                         server.ParseMessage(request, sender);
                     }
-                    if (mode != "deferred") Application::GetInstance().Drain();
+                    if (mode != "deferred" && !mode.ends_with("-deferred")) {
+                        Application::GetInstance().Drain();
+                    }
                 }
                 Application::GetInstance().Drain();
             }
@@ -572,6 +615,44 @@ class McpServerTest(unittest.TestCase):
                              "https://second.example/|second|look")
             self.assertEqual(replies["legacy"]["result"]["content"][0]["text"],
                              "https://last-legacy.example/|legacy-last|last")
+
+    def test_guard_invalidated_after_enqueue_drops_execution_and_reply(self):
+        for custom_sender in (True, False):
+            for mode in ("guarded-deferred", "guarded-json-deferred"):
+                with self.subTest(custom_sender=custom_sender, mode=mode):
+                    response, = self.responses([
+                        self.call(1, "self.camera.take_photo", {"question": "cancelled"}),
+                        ":invalidate", self.call(2, "test.captures", {}),
+                    ], custom_sender, mode=mode, expected_count=1)
+                    self.assertEqual(response["id"], 2)
+                    self.assertEqual(response["result"]["content"][0]["text"], "0")
+
+    def test_guard_invalidated_during_parse_drops_execution_and_reply(self):
+        cases = [self.call("cancelled", "self.camera.take_photo", {"question": "look"}),
+                 self.call("cancelled", "self.camera.take_photo", {}), "{"]
+        for custom_sender in (True, False):
+            for mode in ("guarded-parse-cancel", "guarded-json-parse-cancel"):
+                for request in cases:
+                    with self.subTest(custom_sender=custom_sender, mode=mode, request=request):
+                        response, = self.responses([
+                            request, self.call(2, "test.captures", {}),
+                        ], custom_sender, mode=mode, expected_count=1)
+                        self.assertEqual(response["id"], 2)
+                        self.assertEqual(response["result"]["content"][0]["text"], "0")
+
+    def test_guard_invalidated_during_execution_drops_success_and_error_replies(self):
+        for custom_sender in (True, False):
+            for fail in (False, True):
+                for modern in (False, True):
+                    with self.subTest(custom_sender=custom_sender, fail=fail, modern=modern):
+                        request = (self.modern(1, "tools/call",
+                                   {"name": "test.invalidate", "arguments": {"fail": fail}})
+                                   if modern else self.call(1, "test.invalidate", {"fail": fail}))
+                        response, = self.responses([
+                            request, self.call(2, "test.captures", {}),
+                        ], custom_sender, mode="guarded-immediate", expected_count=1)
+                        self.assertEqual(response["id"], 2)
+                        self.assertEqual(response["result"]["content"][0]["text"], "1")
 
     def test_tool_execution_failure_keeps_legacy_error_and_modern_result(self):
         error = 'error"\\\nmessage'

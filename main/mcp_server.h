@@ -454,6 +454,8 @@ public:
 class McpServer {
 public:
     using ResponseSender = std::function<void(const std::string&)>;
+    // Capture request identity at ingress; false cancels queued work and subsequent replies.
+    using RequestGuard = std::function<bool()>;
     static McpServer& GetInstance() {
         static McpServer instance;
         return instance;
@@ -474,8 +476,10 @@ public:
                  const PropertyList& properties, ContextToolCallback callback);
     void AddUserOnlyTool(const std::string& name, const std::string& description,
                          const PropertyList& properties, ToolCallback callback);
-    void ParseMessage(const cJSON* json, ResponseSender response_sender = nullptr);
-    void ParseMessage(const std::string& message, ResponseSender response_sender = nullptr);
+    void ParseMessage(const cJSON* json, ResponseSender response_sender = nullptr,
+                      RequestGuard request_guard = nullptr);
+    void ParseMessage(const std::string& message, ResponseSender response_sender = nullptr,
+                      RequestGuard request_guard = nullptr);
 
 private:
     McpServer();
@@ -495,7 +499,8 @@ private:
                       bool list_user_only_tools, const ResponseSender& response_sender);
     std::shared_ptr<McpTool> FindTool(std::string_view name) const;
     void DoToolCall(McpRequestContext context, std::shared_ptr<McpTool> tool,
-                    const cJSON* tool_arguments, ResponseSender response_sender);
+                    const cJSON* tool_arguments, ResponseSender response_sender,
+                    RequestGuard request_guard);
 
     mutable std::mutex tools_mutex_;
     std::vector<std::shared_ptr<McpTool>> tools_;

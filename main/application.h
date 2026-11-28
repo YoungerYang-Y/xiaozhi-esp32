@@ -24,6 +24,10 @@
 #include "ota.h"
 #include "protocol.h"
 #include "waiting_response.h"
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+#include "home_network_service.h"
+#include "home_offline_policy.h"
+#endif
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE (1 << 0)
@@ -105,6 +109,16 @@ public:
      */
     void ToggleChatState();
     void PrimaryButtonPressed();
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    void NetworkMenuPressed();
+    bool HandleHomeTouch(int x, int y);
+    bool IsNetworkMenuOpen() const { return home_menu_open_.load(); }
+    uint32_t HomeInteractionGeneration() const { return conversation_intent_.load(); }
+    bool AcceptHomeRemoteAction(uint32_t generation) const {
+        return generation == conversation_intent_.load() && HomeAllowsConversation() &&
+               !IsListeningPaused();
+    }
+#endif
     void ToggleListeningPause();
     bool IsListeningPaused() const;
     bool HasConnectionAlert() const {
@@ -148,7 +162,7 @@ public:
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
-    void SendMcpMessage(const std::string& payload);
+    void SendMcpMessage(const std::string& payload, std::function<bool()> source_guard = nullptr);
     void RegisterMcpBroadcastCallback(std::function<void(const std::string&)> callback);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
@@ -163,12 +177,46 @@ public:
     void ResetProtocol();
 
 private:
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    HomeOfflinePolicy home_policy_;
+    HomeNetworkService home_network_;
+    std::atomic<uint32_t> home_network_epoch_{1};
+    std::atomic_bool home_menu_open_{false};
+    std::atomic_bool home_async_busy_{false};
+    std::atomic_bool home_assets_busy_{false};
+    bool home_use_mqtt_ = true;
+    Protocol::ChannelToken home_health_channel_ = 0;
+    std::atomic_bool home_configuring_{false};
+    std::atomic_bool home_online_{false};
+    std::atomic_bool home_disconnect_pending_{false};
+    bool home_pending_conversation_ = false;
+    std::string home_pending_wake_;
+    bool home_assets_attempted_ = false;
+    uint64_t home_front_deadline_ = 0;
+    esp_timer_handle_t home_command_timer_ = nullptr;
+    std::string home_reason_;
+    void InitializeHomeOffline();
+    void TickHomeOffline();
+    bool HandleHomePrimaryButton();
+    void HomeCancelInteraction();
+    void HomeRestoreStandby();
+    void HomeStartCommand();
+    void HomeHandleCommand(const std::string& action, uint64_t generation);
+    void HomeShowMenu();
+    void HomeExecuteMenu();
+    void HomeSetManualOffline();
+    void HomeStartConversation(const std::string& wake_word = "");
+    void HomeRetireProtocol();
+    void HomeStartAssetUpdate();
+    bool HomeAllowsConversation() const;
+    void HomeProtocolFailure(uint32_t epoch, const Protocol::HealthEvent& event);
+#endif
     Application();
     ~Application();
 
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
-    std::unique_ptr<Protocol> protocol_;
+    std::shared_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
     esp_timer_handle_t startup_wake_word_hint_timer_ = nullptr;

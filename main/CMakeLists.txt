@@ -45,6 +45,10 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             )
 
+if(CONFIG_WAVESHARE_1_85C_HOME_OFFLINE)
+    list(APPEND SOURCES "application_home.cc" "home_network_service.cc")
+endif()
+
 if(CONFIG_WAVESHARE_1_85C_HOME_LOCAL_ALERTS)
     list(APPEND SOURCES "application_alerts.cc")
 endif()

@@ -102,7 +102,20 @@ void Application::Initialize() {
         if (IsListeningPaused()) {
             return;
         }
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+        const auto intent = ConversationIntentSequence();
+        Schedule([this, intent, wake_word]() {
+            if (intent != ConversationIntentSequence() || IsListeningPaused() ||
+                home_assets_busy_ || home_menu_open_ || home_configuring_)
+                return;
+            if (HomeAllowsConversation())
+                HomeStartConversation(wake_word);
+            else
+                HomeStartCommand();
+        });
+#else
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
+#endif
     };
     callbacks.on_vad_change = [this](bool speaking) {
 #if CONFIG_WAVESHARE_1_85C_HOME
@@ -157,15 +170,24 @@ void Application::Initialize() {
         });
     };
 #endif
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    callbacks.on_local_command = [this](const std::string& action, uint64_t generation) {
+        Schedule([this, action, generation]() { HomeHandleCommand(action, generation); });
+    };
+#endif
     audio_service_.SetCallbacks(callbacks);
 
     // Load local fonts, images and speech models before starting the network. A pending
     // update must finish first: these resources can reference the partition being rewritten.
     {
         Settings settings("assets", false);
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+        Assets::GetInstance().Apply();
+#else
         if (settings.GetString("download_url").empty()) {
             CheckAssetsVersion();
         }
+#endif
     }
 
     // Add state change listeners
@@ -188,6 +210,12 @@ void Application::Initialize() {
 
     // Set network event callback for UI updates and network state handling
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+        if (event == NetworkEvent::Disconnected) {
+            home_disconnect_pending_ = true;
+            home_network_.Invalidate(++home_network_epoch_);
+        }
+#endif
 #if CONFIG_WAVESHARE_1_85C_HOME_NETWORK_ALERTS
         if (event == NetworkEvent::Connected || event == NetworkEvent::Disconnected) {
             const bool connected = event == NetworkEvent::Connected;
@@ -204,7 +232,9 @@ void Application::Initialize() {
         switch (event) {
             case NetworkEvent::Scanning:
                 display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
+#if !CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
+#endif
                 break;
             case NetworkEvent::Connecting: {
                 if (data.empty()) {
@@ -258,7 +288,11 @@ void Application::Initialize() {
     });
 
     // Start network asynchronously
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    InitializeHomeOffline();
+#else
     board.StartNetwork();
+#endif
 
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
@@ -322,7 +356,11 @@ void Application::Run() {
             HandleStateChangedEvent();
         }
 
-        if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
+        if ((bits & MAIN_EVENT_PLAYBACK_DRAINED)
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+            && !home_assets_busy_
+#endif
+        ) {
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
             }
@@ -355,9 +393,17 @@ void Application::Run() {
             protocol_->ProcessPending();
         }
 
-        if (bits & MAIN_EVENT_SEND_AUDIO) {
+        if ((bits & MAIN_EVENT_SEND_AUDIO)
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+            && !home_assets_busy_
+#endif
+        ) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (IsListeningPaused()) {
+                if (IsListeningPaused()
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+                    || !HomeAllowsConversation()
+#endif
+                ) {
                     continue;
                 }
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
@@ -395,6 +441,9 @@ void Application::Run() {
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
             UpdateWaitingResponse();
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+            TickHomeOffline();
+#endif
 #if CONFIG_WAVESHARE_1_85C_HOME_LOCAL_ALERTS
             TickLocalPrompts();
 #endif
@@ -416,6 +465,20 @@ void Application::Run() {
 }
 
 void Application::HandleNetworkConnectedEvent() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    if (home_disconnect_pending_)
+        HandleNetworkDisconnectedEvent();
+    home_online_ = false;
+    home_configuring_ = false;
+    home_reason_.clear();
+    if (home_policy_.mode() != HomeOfflinePolicy::Mode::ManualOffline) {
+        home_policy_.AllowNetwork(esp_timer_get_time() / 1000);
+        if (!home_policy_.CommandActive() && !home_policy_.MenuOpen())
+            SetDeviceState(kDeviceStateOffline);
+    }
+    TickHomeOffline();
+    return;
+#endif
     ESP_LOGI(TAG, "Network connected");
 #if CONFIG_WAVESHARE_1_85C_HOME_NETWORK_ALERTS
     if (!wifi_link_connected_.load()) {
@@ -449,6 +512,24 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    const bool disconnected = home_disconnect_pending_.exchange(false);
+    if (home_policy_.mode() != HomeOfflinePolicy::Mode::ManualOffline &&
+        (disconnected || !Board::GetInstance().IsNetworkConnected())) {
+        if (home_online_.exchange(false))
+            HomeCancelInteraction();
+        home_reason_ = "网络未连接";
+        home_policy_.AllowNetwork(esp_timer_get_time() / 1000);
+        if (home_policy_.MenuOpen()) {
+            Board::GetInstance().GetDisplay()->ShowNetworkMenu({}, 0);
+            home_policy_.OpenMenu();  // Rebuild changed choices, invalidate old touch rows.
+        }
+        if (!home_policy_.CommandActive() && !home_configuring_)
+            SetDeviceState(kDeviceStateOffline);
+        HomeRestoreStandby();
+    }
+    return;
+#endif
 #if CONFIG_WAVESHARE_1_85C_HOME_NETWORK_ALERTS
     const auto disconnected = wifi_disconnect_sequence_.load();
     if (disconnected != processed_wifi_disconnect_sequence_ || !wifi_link_connected_.load()) {
@@ -762,17 +843,31 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    home_health_channel_ = 0;
+    if (home_use_mqtt_) {
+#else
     if (ota_->HasMqttConfig()) {
-        protocol_ = std::make_unique<MqttProtocol>();
+#endif
+        protocol_ = std::make_shared<MqttProtocol>();
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    } else {
+        protocol_ = std::make_shared<WebsocketProtocol>();
+#else
     } else if (ota_->HasWebsocketConfig()) {
-        protocol_ = std::make_unique<WebsocketProtocol>();
+        protocol_ = std::make_shared<WebsocketProtocol>();
     } else {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
-        protocol_ = std::make_unique<MqttProtocol>();
+        protocol_ = std::make_shared<MqttProtocol>();
+#endif
     }
 
 #if CONFIG_WAVESHARE_1_85C_HOME_NETWORK_ALERTS
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    const bool uses_mqtt = home_use_mqtt_;
+#else
     const bool uses_mqtt = ota_->HasMqttConfig() || !ota_->HasWebsocketConfig();
+#endif
     Schedule([this, callback_epoch, uses_mqtt]() {
         if (callback_epoch != protocol_callback_epoch_.load()) {
             return;
@@ -808,8 +903,19 @@ void Application::InitializeProtocol() {
                 (intent != ConversationIntentSequence() || pause != ListeningPauseSequence())) {
                 return;
             }
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+            HomeProtocolFailure(callback_epoch, event);
+            if (callback_epoch != protocol_callback_epoch_.load())
+                return;
+#endif
             HandleProtocolHealthEvent(event);
         });
+    });
+#endif
+
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE && !CONFIG_WAVESHARE_1_85C_HOME_NETWORK_ALERTS
+    protocol_->OnHealthEvent([this, callback_epoch](const Protocol::HealthEvent& event) {
+        Schedule([this, callback_epoch, event]() { HomeProtocolFailure(callback_epoch, event); });
     });
 #endif
 
@@ -838,6 +944,15 @@ void Application::InitializeProtocol() {
                 pause_sequence != ListeningPauseSequence()) {
                 return;
             }
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+            home_online_ = false;
+            home_reason_ = "语音服务不可用";
+            home_policy_.RecoveryFailed(esp_timer_get_time() / 1000);
+            HomeCancelInteraction();
+            SetDeviceState(kDeviceStateOffline);
+            HomeRestoreStandby();
+            return;
+#endif
             pending_error_callback_epoch_ = callback_epoch;
             pending_error_intent_ = intent;
             pending_error_pause_sequence_ = pause_sequence;
@@ -871,20 +986,27 @@ void Application::InitializeProtocol() {
         }
     });
 
-    protocol_->OnAudioChannelOpened([this, codec, &board](Protocol::ChannelToken token) {
+    protocol_->OnAudioChannelOpened(
+        [this, codec, &board, callback_epoch](Protocol::ChannelToken token) {
+            Schedule([this, codec, &board, callback_epoch, token]() {
 #if CONFIG_WAVESHARE_1_85C_HOME
-        if (!protocol_ || token != protocol_->channel_token() || IsListeningPaused()) {
-            return;
-        }
+                if (callback_epoch != protocol_callback_epoch_.load())
+                    return;
 #endif
-        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
-        if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
-            ESP_LOGW(TAG,
-                     "Server sample rate %d does not match device output sample rate %d, "
-                     "resampling may cause distortion",
-                     protocol_->server_sample_rate(), codec->output_sample_rate());
-        }
-    });
+#if CONFIG_WAVESHARE_1_85C_HOME
+                if (!protocol_ || token != protocol_->channel_token() || IsListeningPaused()) {
+                    return;
+                }
+#endif
+                board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+                if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
+                    ESP_LOGW(TAG,
+                             "Server sample rate %d does not match device output sample rate %d, "
+                             "resampling may cause distortion",
+                             protocol_->server_sample_rate(), codec->output_sample_rate());
+                }
+            });
+        });
 
     protocol_->OnAudioChannelClosed([this, &board, callback_epoch](Protocol::ChannelToken token) {
         uint32_t intent = 0;
@@ -927,6 +1049,20 @@ void Application::InitializeProtocol() {
         if (callback_epoch != protocol_callback_epoch_.load()) {
             return;
         }
+#endif
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+        const auto source_intent = ConversationIntentSequence();
+        const auto source_pause = ListeningPauseSequence();
+        auto source_guard = [this, callback_epoch, source_intent, source_pause]() {
+            return callback_epoch == protocol_callback_epoch_.load() &&
+                   source_intent == ConversationIntentSequence() &&
+                   source_pause == ListeningPauseSequence() && HomeAllowsConversation() &&
+                   !IsListeningPaused();
+        };
+        if (!source_guard())
+            return;
+#else
+        auto source_guard = []() { return true; };
 #endif
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
@@ -973,7 +1109,7 @@ void Application::InitializeProtocol() {
                 }
             }
 
-            Schedule([this, pause_sequence, callback_epoch,
+            Schedule([this, pause_sequence, callback_epoch, source_guard,
                       url = std::string(audio_url->valuestring),
                       subtitles = std::move(subtitles)]() mutable {
 #if CONFIG_WAVESHARE_1_85C_HOME
@@ -984,6 +1120,8 @@ void Application::InitializeProtocol() {
                 if (IsListeningPaused() || pause_sequence != ListeningPauseSequence()) {
                     return;
                 }
+                if (!source_guard())
+                    return;
                 StartNotification(std::move(url), std::move(subtitles));
             });
         } else if (strcmp(type->valuestring, "tts") == 0) {
@@ -1083,7 +1221,12 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "mcp") == 0) {
             auto payload = cJSON_GetObjectItem(root, "payload");
             if (cJSON_IsObject(payload)) {
-                McpServer::GetInstance().ParseMessage(payload);
+                McpServer::GetInstance().ParseMessage(
+                    payload,
+                    [this, source_guard](const std::string& response) {
+                        SendMcpMessage(response, source_guard);
+                    },
+                    source_guard);
             }
         } else if (strcmp(type->valuestring, "system") == 0) {
             auto command = cJSON_GetObjectItem(root, "command");
@@ -1091,7 +1234,14 @@ void Application::InitializeProtocol() {
                 ESP_LOGI(TAG, "System command: %s", command->valuestring);
                 if (strcmp(command->valuestring, "reboot") == 0) {
                     // Do a reboot if user requests a OTA update
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+                    Schedule([this, source_guard]() {
+                        if (source_guard())
+                            Reboot();
+                    });
+#else
                     Schedule([this]() { Reboot(); });
+#endif
                 } else {
                     ESP_LOGW(TAG, "Unknown system command: %s", command->valuestring);
                 }
@@ -1101,8 +1251,18 @@ void Application::InitializeProtocol() {
             auto message = cJSON_GetObjectItem(root, "message");
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(status) && cJSON_IsString(message) && cJSON_IsString(emotion)) {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+                Schedule([this, source_guard, status = std::string(status->valuestring),
+                          message = std::string(message->valuestring),
+                          emotion = std::string(emotion->valuestring)]() {
+                    if (source_guard())
+                        Alert(status.c_str(), message.c_str(), emotion.c_str(),
+                              Lang::Sounds::OGG_VIBRATION);
+                });
+#else
                 Alert(status->valuestring, message->valuestring, emotion->valuestring,
                       Lang::Sounds::OGG_VIBRATION);
+#endif
             } else {
                 ESP_LOGW(TAG, "Alert command requires status, message and emotion");
             }
@@ -1127,7 +1287,9 @@ void Application::InitializeProtocol() {
         }
     });
 
+#if !CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
     protocol_->Start();
+#endif
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -1185,7 +1347,11 @@ void Application::ToggleChatState() {
 
 void Application::PrimaryButtonPressed() {
 #if CONFIG_WAVESHARE_1_85C_HOME
-    if (IsListeningPaused()) {
+    if (IsListeningPaused()
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+        && !home_menu_open_.load() && !home_configuring_.load()
+#endif
+    ) {
         return;
     }
     primary_button_sequence_.store(ListeningPauseSequence());
@@ -1198,6 +1364,9 @@ void Application::ToggleListeningPause() {
 #if CONFIG_WAVESHARE_1_85C_HOME
     auto state = GetDeviceState();
     if (state != kDeviceStateIdle && state != kDeviceStateConnecting &&
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+        state != kDeviceStateOffline && state != kDeviceStateLocalCommand &&
+#endif
         state != kDeviceStateListening && state != kDeviceStateSpeaking &&
         state != kDeviceStateNotifying) {
         return;
@@ -1271,6 +1440,18 @@ bool Application::AcceptConversationChannel() {
 }
 
 bool Application::ApplyPendingListeningPause() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    const auto requests = pause_requests_.load();
+    if (home_assets_busy_ || requests == processed_pause_requests_)
+        return false;
+    listening_paused_ = (requests & 1U) != 0;
+    processed_pause_requests_ = requests;
+    HomeCancelInteraction();
+    SetDeviceState(home_policy_.mode() == HomeOfflinePolicy::Mode::Online ? kDeviceStateIdle
+                                                                          : kDeviceStateOffline);
+    HomeRestoreStandby();
+    return true;
+#else
 #if CONFIG_WAVESHARE_1_85C_HOME
     const auto requests = pause_requests_.load();
     if (requests == processed_pause_requests_) {
@@ -1317,9 +1498,16 @@ bool Application::ApplyPendingListeningPause() {
 #else
     return false;
 #endif
+#endif
 }
 
 void Application::HandlePrimaryButtonEvent() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    if (primary_button_sequence_.load() != ListeningPauseSequence())
+        return;
+    if (HandleHomePrimaryButton())
+        return;
+#endif
 #if CONFIG_WAVESHARE_1_85C_HOME
     if (IsListeningPaused() || primary_button_sequence_.load() != ListeningPauseSequence()) {
         return;
@@ -1365,6 +1553,10 @@ void Application::StartListening() {
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 void Application::HandleToggleChatEvent() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    HandleHomePrimaryButton();
+    return;
+#endif
     if (IsListeningPaused()) {
         return;
     }
@@ -1453,6 +1645,10 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 void Application::HandleStartListeningEvent() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    HandleHomePrimaryButton();
+    return;
+#endif
     if (IsListeningPaused()) {
         return;
     }
@@ -1523,6 +1719,16 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    if (home_assets_busy_ || home_policy_.MenuOpen() || home_configuring_ || IsListeningPaused())
+        return;
+    if (home_policy_.mode() != HomeOfflinePolicy::Mode::Online) {
+        HomeStartCommand();
+        return;
+    }
+    HomeStartConversation(audio_service_.GetLastWakeWord());
+    return;
+#endif
     if (IsListeningPaused()) {
         return;
     }
@@ -1669,6 +1875,15 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 }
 
 void Application::HandleStateChangedEvent() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    if (home_assets_busy_)
+        return;
+    if (home_policy_.MenuOpen() || GetDeviceState() == kDeviceStateOffline ||
+        GetDeviceState() == kDeviceStateLocalCommand) {
+        HomeRestoreStandby();
+        return;
+    }
+#endif
     DeviceState new_state = state_machine_.GetState();
     clock_ticks_ = 0;
     // Any state change invalidates a pending deferred listening start;
@@ -1753,6 +1968,10 @@ void Application::HandleStateChangedEvent() {
             // Do nothing
             break;
     }
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    if (new_state == kDeviceStateIdle)
+        HomeRestoreStandby();
+#endif
     if (IsListeningPaused() && new_state == kDeviceStateIdle) {
         display->SetStatus(Lang::Strings::LISTENING_PAUSED);
     }
@@ -1762,6 +1981,10 @@ void Application::HandleStateChangedEvent() {
 }
 
 void Application::ShowStartupWakeWordHint() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    if (home_assets_busy_ || !HomeAllowsConversation())
+        return;
+#endif
     // A coalesced activation/state event can queue another idle UI cleanup.
     // Wait for it before adding the hint, or ClearChatMessages() would erase it.
     if (!pending_startup_wake_word_hint_ ||
@@ -2134,6 +2357,15 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    Schedule([this, wake_word]() {
+        if (!HomeAllowsConversation())
+            HomeStartCommand();
+        else
+            HomeStartConversation(wake_word);
+    });
+    return;
+#endif
     if (IsListeningPaused() || !protocol_) {
         return;
     }
@@ -2174,6 +2406,10 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 }
 
 bool Application::CanEnterSleepMode() {
+#if CONFIG_WAVESHARE_1_85C_HOME_OFFLINE
+    if (home_assets_busy_ || home_menu_open_ || home_async_busy_)
+        return false;
+#endif
     if (GetDeviceState() != kDeviceStateIdle) {
         return false;
     }
@@ -2194,9 +2430,11 @@ void Application::RegisterMcpBroadcastCallback(std::function<void(const std::str
     mcp_broadcast_callback_ = std::move(callback);
 }
 
-void Application::SendMcpMessage(const std::string& payload) {
-    // Always schedule to run in main task for thread safety
-    Schedule([this, payload]() {
+void Application::SendMcpMessage(const std::string& payload, std::function<bool()> source_guard) {
+    // Preserve request provenance through the final queue hop.
+    Schedule([this, payload, source_guard = std::move(source_guard)]() {
+        if (source_guard && !source_guard())
+            return;
         if (protocol_) {
             protocol_->SendMcpMessage(payload);
         }

@@ -955,6 +955,11 @@ config WAVESHARE_1_85C_HOME
         Local home variant. Keep fetching service configuration and activation
         information, but skip automatic firmware installation at startup.
 
+config WAVESHARE_1_85C_HOME_OFFLINE
+    bool "Home offline commands and network menu"
+    depends on WAVESHARE_1_85C_HOME
+    default y
+
 config WAVESHARE_1_85C_HOME_NETWORK_ALERTS
     bool "Stage-aware network alerts for the home variant"
     depends on WAVESHARE_1_85C_HOME
