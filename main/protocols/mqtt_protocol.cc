@@ -15,14 +15,21 @@
 
 #define TAG "MQTT"
 
-MqttProtocol::MqttProtocol() {
+MqttProtocol::MqttProtocol(bool recovery_probe) {
+    recovery_probe_ = recovery_probe;
     event_group_handle_ = xEventGroupCreate();
+    if (recovery_probe_) {
+        return;
+    }
 
     // Initialize reconnect timer
     esp_timer_create_args_t reconnect_timer_args = {
         .callback =
             [](void* arg) {
                 MqttProtocol* protocol = (MqttProtocol*)arg;
+                if (protocol->recovery_probe_) {
+                    return;
+                }
                 auto& app = Application::GetInstance();
                 if (app.GetDeviceState() == kDeviceStateIdle) {
                     ESP_LOGI(TAG, "Reconnecting to MQTT server");
@@ -136,7 +143,9 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         }
         ESP_LOGI(TAG, "MQTT disconnected, schedule reconnect in %d seconds",
                  MQTT_RECONNECT_INTERVAL_MS / 1000);
-        esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000);
+        if (!recovery_probe_) {
+            esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000);
+        }
     });
 
     mqtt_->OnConnected([this, attempt]() {
@@ -150,7 +159,9 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         if (on_connected_ != nullptr) {
             on_connected_();
         }
-        esp_timer_stop(reconnect_timer_);
+        if (reconnect_timer_ != nullptr) {
+            esp_timer_stop(reconnect_timer_);
+        }
     });
 
     mqtt_->OnMessage([this, attempt](const std::string& topic, const std::string& payload) {
@@ -186,6 +197,11 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         } else if (strcmp(type->valuestring, "goodbye") == 0) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
             if (cJSON_IsString(session_id) && current_session == session_id->valuestring) {
+                if (recovery_probe_) {
+                    EmitHealthEvent({HealthStage::Handshake, HealthOutcome::Failed, token, token});
+                    cJSON_Delete(root);
+                    return;
+                }
                 auto alive = alive_;  // Capture alive flag
                 Application::GetInstance().Schedule([this, alive, generation]() {
                     if (*alive) {
@@ -610,7 +626,7 @@ bool MqttProtocol::OpenAudioChannel() {
         udp_ = std::move(udp);
     }
     if (probe != nullptr) {
-        if (probe_timer_ == nullptr) {
+        if (!recovery_probe_ && probe_timer_ == nullptr) {
             const esp_timer_create_args_t args = {
                 .callback =
                     [](void*) {
@@ -979,7 +995,9 @@ void MqttProtocol::ProcessPending() {
             }
         }
         if (failed) {
-            esp_timer_stop(probe_timer_);
+            if (probe_timer_ != nullptr) {
+                esp_timer_stop(probe_timer_);
+            }
         } else {
             // Arm before Send: a fast PONG may replace this with the next-period timer.
             ArmProbeTimer(channel->probe.NextActionAt());

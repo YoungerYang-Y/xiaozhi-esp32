@@ -85,6 +85,10 @@ public:
     // locks; application consumers must schedule mutations on their own task.
     void OnHealthEvent(std::function<void(const HealthEvent&)> callback);
 
+    // Set before Start/Open on a dedicated recovery instance. No application
+    // work or automatic reconnect may escape this instance's worker lifetime.
+    void SetRecoveryProbe(bool enabled = true) { recovery_probe_ = enabled; }
+
     virtual bool Start() = 0;
     virtual bool OpenAudioChannel() = 0;
     virtual void CloseAudioChannel(bool send_goodbye = true) = 0;
@@ -99,6 +103,7 @@ public:
     virtual void SendMcpMessage(const std::string& message);
 
 protected:
+    bool recovery_probe_ = false;
     std::function<void(const cJSON* root, ChannelToken)> on_incoming_json_;
     std::function<void(std::unique_ptr<AudioStreamPacket> packet, ChannelToken)> on_incoming_audio_;
     std::function<void(ChannelToken)> on_audio_channel_opened_;

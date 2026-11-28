@@ -26,7 +26,7 @@
 
 class MqttProtocol : public Protocol {
 public:
-    MqttProtocol();
+    explicit MqttProtocol(bool recovery_probe = false);
     ~MqttProtocol();
 
     bool Start() override;
@@ -60,7 +60,7 @@ private:
     int udp_port_;
     uint32_t local_sequence_;
     uint32_t remote_sequence_;
-    esp_timer_handle_t reconnect_timer_;
+    esp_timer_handle_t reconnect_timer_ = nullptr;
 
     struct ProbeChannel {
         explicit ProbeChannel(const uint8_t* ssrc) : probe(ssrc) {}

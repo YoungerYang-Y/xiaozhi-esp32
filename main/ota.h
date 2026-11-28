@@ -6,6 +6,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <esp_err.h>
@@ -24,6 +25,10 @@ public:
     Ota();
     ~Ota();
 
+    // Optional worker cancellation, checked at I/O and persistent-write boundaries.
+    void SetCancellationCheck(std::function<bool()> check) {
+        cancellation_check_ = std::move(check);
+    }
     NetworkResult<> CheckVersion();
     esp_err_t Activate();
     bool HasActivationChallenge() { return has_activation_challenge_; }
@@ -33,7 +38,8 @@ public:
     bool HasActivationCode() { return has_activation_code_; }
     bool HasServerTime() { return has_server_time_; }
     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
-    static bool Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback);
+    static bool Upgrade(const std::string& firmware_url,
+                        std::function<void(int progress, size_t speed)> callback);
     void MarkCurrentVersionValid();
 
     const std::string& GetFirmwareVersion() const { return firmware_version_; }
@@ -44,6 +50,8 @@ public:
     std::string GetCheckVersionUrl();
 
 private:
+    std::function<bool()> cancellation_check_;
+    bool IsCancelled() const { return cancellation_check_ && cancellation_check_(); }
     std::string activation_message_;
     std::string activation_code_;
     bool has_new_version_ = false;
@@ -67,4 +75,4 @@ private:
     std::unique_ptr<Http> SetupHttp();
 };
 
-#endif // _OTA_H
+#endif  // _OTA_H
