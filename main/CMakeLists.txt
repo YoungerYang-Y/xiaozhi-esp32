@@ -1118,7 +1118,15 @@ endif()
 
 # Define generation path
 set(LANG_JSON "${CMAKE_CURRENT_SOURCE_DIR}/assets/locales/${LANG_DIR}/language.json")
-set(LANG_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/assets/lang_config.h")
+set(LANG_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(LANG_HEADER "${LANG_INCLUDE_DIR}/xiaozhi_lang_config.h")
+list(PREPEND INCLUDE_DIRS "${LANG_INCLUDE_DIR}")
+# Existing sources keep their include path; the shared wrapper has no locale data.
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    file(MAKE_DIRECTORY "${LANG_INCLUDE_DIR}")
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/assets/lang_config.h.in"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/assets/lang_config.h" COPYONLY)
+endif()
 
 # Collect current language audio files
 file(GLOB LANG_SOUNDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/locales/${LANG_DIR}/*.ogg)
@@ -1303,7 +1311,7 @@ endif()
 # Add generation rules
 add_custom_command(
     OUTPUT ${LANG_HEADER}
-    COMMAND python ${PROJECT_DIR}/scripts/gen_lang.py
+    COMMAND "${PYTHON}" ${PROJECT_DIR}/scripts/gen_lang.py
             --language "${LANG_DIR}"
             --output "${LANG_HEADER}"
     DEPENDS
@@ -1317,6 +1325,7 @@ add_custom_command(
 add_custom_target(lang_header ALL
     DEPENDS ${LANG_HEADER}
 )
+add_dependencies(${COMPONENT_LIB} lang_header)
 
 # Find ESP-SR component dynamically
 find_component_by_pattern("espressif__esp-sr" ESP_SR_COMPONENT ESP_SR_COMPONENT_PATH)

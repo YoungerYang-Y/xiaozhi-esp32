@@ -51,13 +51,9 @@ def get_sound_files(directory):
     return [f for f in os.listdir(directory) if f.endswith('.ogg')]
 
 def generate_header(lang_code, output_path):
-    # 从输出路径推导项目结构
-    # output_path 通常是 main/assets/lang_config.h
-    main_dir = os.path.dirname(output_path)  # main/assets
-    if os.path.basename(main_dir) == 'assets':
-        main_dir = os.path.dirname(main_dir)  # main
-    project_dir = os.path.dirname(main_dir)  # 项目根目录
-    assets_dir = os.path.join(main_dir, 'assets')
+    # Inputs belong to this checkout; output may be in any build directory.
+    project_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    assets_dir = os.path.join(project_dir, 'main', 'assets')
     
     # 构建语言JSON文件路径
     input_path = os.path.join(assets_dir, 'locales', lang_code, 'language.json')
